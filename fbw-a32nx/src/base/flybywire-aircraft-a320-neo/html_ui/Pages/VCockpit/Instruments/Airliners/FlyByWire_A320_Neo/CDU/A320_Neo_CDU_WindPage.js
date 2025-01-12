@@ -105,6 +105,8 @@ class CDUWindPage {
         mcdu.clearDisplay();
         mcdu.page.Current = mcdu.page.DescentWind;
 
+        const alternateAirport = mcdu.flightPlanService.active ? mcdu.flightPlanService.active.alternateDestinationAirport : undefined;
+
         let requestButton = "REQUEST*[color]amber";
         let requestEnable = true;
         if (mcdu.simbrief.sendStatus === "REQUESTING") {
@@ -112,17 +114,23 @@ class CDUWindPage {
             requestButton = "REQUEST [color]amber";
         }
 
-        let alternateCell = "[ ]°/[ ][color]cyan";
+        let alternateHeader = "";
+        let alternateCell = "";
+        let altFLightlevel = "";
 
-        if (mcdu.winds.alternate != null) {
-            alternateCell = `${CDUWindPage.FormatNumber(mcdu.winds.alternate.direction)}°/${CDUWindPage.FormatNumber(mcdu.winds.alternate.speed)}[color]cyan`;
+        if (alternateAirport) {
+            alternateHeader = "ALTN WIND";
+            alternateCell = "[ ]°/[ ][color]cyan";
+            altFLightlevel = "{green}{small}FL100{end}{end}";
+            if (mcdu.winds.alternate != null) {
+                alternateCell = `${CDUWindPage.FormatNumber(mcdu.winds.alternate.direction)}°/${CDUWindPage.FormatNumber(mcdu.winds.alternate.speed)}[color]cyan`;
+            }
         }
-
         const template = [
             ["DESCENT WIND"],
-            ["TRU WIND/ALT", "ALTN WIND"],
+            ["TRU WIND/ALT", alternateHeader],
             ["", alternateCell],
-            ["", "{green}{small}FL100{end}{end}"],
+            ["", altFLightlevel],
             ["", ""],
             ["", "WIND{sp}[color]amber"],
             ["", requestButton],
@@ -136,21 +144,23 @@ class CDUWindPage {
 
         mcdu.setTemplate(CDUWindPage.ShowWinds(template, mcdu, CDUWindPage.ShowDESPage, mcdu.winds.des, offset, 5));
 
-        mcdu.onRightInput[0] = (value, scratchpadCallback) => {
-            if (value == FMCMainDisplay.clrValue) {
-                mcdu.winds.alternate = null;
-                CDUWindPage.ShowDESPage(mcdu, offset);
-                return;
-            }
-            const wind = CDUWindPage.ParseWind(value);
-            if (wind == null) {
-                mcdu.setScratchpadMessage(NXSystemMessages.formatError);
-                scratchpadCallback();
-            } else {
-                mcdu.winds.alternate = wind;
-                CDUWindPage.ShowDESPage(mcdu, offset);
-            }
-        };
+        if (alternateAirport) {
+            mcdu.onRightInput[0] = (value, scratchpadCallback) => {
+                if (value == FMCMainDisplay.clrValue) {
+                    mcdu.winds.alternate = null;
+                    CDUWindPage.ShowDESPage(mcdu, offset);
+                    return;
+                }
+                const wind = CDUWindPage.ParseWind(value);
+                if (wind == null) {
+                    mcdu.setScratchpadMessage(NXSystemMessages.formatError);
+                    scratchpadCallback();
+                } else {
+                    mcdu.winds.alternate = wind;
+                    CDUWindPage.ShowDESPage(mcdu, offset);
+                }
+            };
+        }
 
         mcdu.onRightInput[3] = () => {
             CDUWindPage.ShowCRZPage(mcdu);
@@ -369,11 +379,14 @@ class CDUWindPage {
                     const tod = mcdu.simbrief.navlog.find((val) => val.ident === "TOD");
                     const desWpts = [tod, ...mcdu.simbrief.navlog.filter((val) => val.stage === stage)];
 
-                    mcdu.winds.alternate = {
-                        direction: mcdu.simbrief.alternateAvgWindDir,
-                        speed: mcdu.simbrief.alternateAvgWindSpd,
-                    };
-
+                    if (isFinite(mcdu.simbrief.alternateAvgWindDir) && isFinite(mcdu.simbrief.alternateAvgWindSpd)) {
+                        mcdu.winds.alternate = {
+                            direction: mcdu.simbrief.alternateAvgWindDir,
+                            speed: mcdu.simbrief.alternateAvgWindSpd,
+                        };
+                    } else {
+                        mcdu.winds.alternate = null;
+                    }
                     // iterate through each clbWpt grabbing the wind data
                     windData = [];
                     lastAltitude = 45000;
