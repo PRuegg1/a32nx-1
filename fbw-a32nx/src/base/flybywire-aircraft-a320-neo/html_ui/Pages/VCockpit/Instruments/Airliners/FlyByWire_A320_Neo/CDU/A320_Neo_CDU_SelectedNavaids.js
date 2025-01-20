@@ -1,3 +1,7 @@
+// Copyright (c) 2021-2023 FlyByWire Simulations
+//
+// SPDX-License-Identifier: GPL-3.0
+
 /**
  * @typedef {Object} SelectedNavaid
  * @property {Fmgc.SelectedNavaidType} type
@@ -61,7 +65,7 @@ class CDUSelectedNavaids {
             const lineRow = labelRow + 1;
 
             template[labelRow][0] = `\xa0${NAVAID_TYPE_STRINGS[navaid.type].padEnd(9, '\xa0')}${NAVAID_MODE_STRINGS[navaid.mode]}`;
-            template[lineRow][0] = `{cyan}${navaid.facility !== null ? '{' : '\xa0'}${(navaid.ident.length > 0 ? navaid.ident : '').padEnd(6, '\xa0')}{end}{small}{green}${navaid.frequency.toFixed(2)}{end}{end}`;
+            template[lineRow][0] = `{cyan}${navaid.facility !== null ? '{' : '\xa0'}${(navaid.ident !== null ? navaid.ident : '').padEnd(6, '\xa0')}{end}{small}{green}${navaid.frequency.toFixed(2)}{end}{end}`;
 
             if (navaid.facility !== null) {
                 mcdu.onLeftInput[i] = (text, scratchpadCallback) => {
@@ -84,7 +88,8 @@ class CDUSelectedNavaids {
 
             const lineRow = 2 * i + 2;
 
-            template[lineRow][1] = `{cyan}${WayPoint.formatIdentFromIcao(icao)}{end}`;
+            // FIXME take facilities rather than database idents
+            template[lineRow][1] = `{cyan}${icao.substring(7).trim()}{end}`;
 
             mcdu.onRightInput[i] = (text, scratchpadCallback) => {
                 if (text === FMCMainDisplay.clrValue) {
@@ -94,7 +99,7 @@ class CDUSelectedNavaids {
                     mcdu.getOrSelectNavaidsByIdent(text, (navaid) => {
                         if (navaid) {
                             mcdu.reselectNavaid(icao);
-                            mcdu.deselectNavaid(navaid.infos.icao);
+                            mcdu.deselectNavaid(navaid.databaseId);
                             CDUSelectedNavaids.ShowPage(mcdu);
                         } else {
                             mcdu.setScratchpadMessage(NXSystemMessages.notInDatabase);
@@ -114,7 +119,7 @@ class CDUSelectedNavaids {
                 if (text.match(/^[A-Z0-9]{1,4}$/) !== null) {
                     mcdu.getOrSelectNavaidsByIdent(text, (navaid) => {
                         if (navaid) {
-                            mcdu.deselectNavaid(navaid.infos.icao);
+                            mcdu.deselectNavaid(navaid.databaseId);
                             CDUSelectedNavaids.ShowPage(mcdu);
                         } else {
                             mcdu.setScratchpadMessage(NXSystemMessages.notInDatabase);
