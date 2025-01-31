@@ -24,10 +24,9 @@ pub struct ExternalPowerSource {
     output_potential: ElectricPotential,
 }
 impl ExternalPowerSource {
-    pub fn new(context: &mut InitContext) -> ExternalPowerSource {
+    pub fn new(context: &mut InitContext, id: u32) -> ExternalPowerSource {
         ExternalPowerSource {
-            external_power_available_id: context
-                .get_identifier("EXTERNAL POWER AVAILABLE:1".to_owned()),
+            external_power_available_id: context.get_identifier(format!("EXT_PWR_AVAIL:{id}")),
             identifier: context.next_electrical_identifier(),
             writer: ElectricalStateWriter::new(context, "EXT_PWR"),
             is_connected: false,
@@ -130,12 +129,12 @@ mod external_power_source_tests {
         }
 
         fn with_connected_external_power(mut self) -> Self {
-            self.write_by_name("EXTERNAL POWER AVAILABLE:1", true);
+            self.write_by_name("EXT_PWR_AVAIL:1", true);
             self
         }
 
         fn disconnect_external_power(&mut self) {
-            self.write_by_name("EXTERNAL POWER AVAILABLE:1", false);
+            self.write_by_name("EXT_PWR_AVAIL:1", false);
         }
 
         fn frequency_is_normal(&mut self) -> bool {
@@ -169,7 +168,7 @@ mod external_power_source_tests {
     impl TestAircraft {
         fn new(context: &mut InitContext) -> Self {
             Self {
-                ext_pwr: ExternalPowerSource::new(context),
+                ext_pwr: ExternalPowerSource::new(context, 1),
                 ext_pwr_output_within_normal_parameters_before_processing_power_consumption_report: false,
             }
         }

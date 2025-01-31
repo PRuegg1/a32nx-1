@@ -19,8 +19,9 @@ It's recommended to set gitbash as your default shell in vscode
 ## Cloning and setup
 
 ```shell
-git clone https://github.com/flybywiresim/a32nx.git
-cd a32nx
+git clone https://github.com/flybywiresim/aircraft.git
+cd aircraft
+git submodule update --init
 .\scripts\dev-env\run.cmd ./scripts/setup.sh
 ```
 
@@ -32,10 +33,9 @@ cd a32nx
 
 Note that you should use `run.sh` instead of `run.cmd` if you are on Linux (including WSL).
 
-If you are using WSL, ensure that the `Vmmem` process is not memory limited. At least `10GB` of memory is the recommended setting. This can be configured in `C:\<user>\.wslconfig`.
-## Asobo branch
+To build only the A32NX or the A380X, change `build.sh` to `build_a32nx.sh` or `build_a380x.sh`. To build the A380X with 4K textures instead of maximum quality (8K), add the `-4k` flag at the end of the command.
 
-The master branch only contains files which have been modified from the original package. If you wish to work on a file that isn't present in the master branch, simply copy it over from the latest Asobo branch, and add it in its own commit. Please DO NOT add, modify, or delete files from the Asobo branch.
+If you are using WSL, ensure that the `Vmmem` process is not memory limited. At least `10GB` of memory is the recommended setting. This can be configured in `C:\<user>\.wslconfig`.
 
 ## Helping others
 
@@ -70,7 +70,7 @@ When submitting an issue, there's a few guidelines we'd ask you to respect to ma
 
 We welcome pull requests with fixes and improvements to the project.
 
-If you wish to add a new feature or you spot a bug that you wish to fix, **please open an issue for it first** on the [A32NX issue tracker](https://github.com/flybywiresim/a32nx/issues).
+If you wish to add a new feature or you spot a bug that you wish to fix, **please open an issue for it first** on the [A32NX issue tracker](https://github.com/flybywiresim/aircraft/issues).
 
 The work-flow for submitting a new pull request is designed to be simple, but also to ensure consistency from **all** contributors:
 * Fork the project into your personal space on GitHub.com.

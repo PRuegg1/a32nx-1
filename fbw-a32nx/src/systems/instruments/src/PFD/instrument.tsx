@@ -1,255 +1,130 @@
-import { DisplayManagementComputer } from 'instruments/src/PFD/shared/DisplayManagementComputer';
-import { Clock, FSComponent, EventBus, HEventPublisher } from 'msfssdk';
+// Copyright (c) 2021-2023 FlyByWire Simulations
+//
+// SPDX-License-Identifier: GPL-3.0
+
+import { Clock, FSComponent, HEventPublisher, InstrumentBackplane, Subject } from '@microsoft/msfs-sdk';
+import { ArincEventBus } from '@flybywiresim/fbw-sdk';
+import { FwcPublisher, RopRowOansPublisher } from '@flybywiresim/msfs-avionics-common';
+
+import { FmsDataPublisher } from '../MsfsAvionicsCommon/providers/FmsDataPublisher';
+import { DmcPublisher } from '../MsfsAvionicsCommon/providers/DmcPublisher';
+import { ExtendedClockEventProvider } from '../MsfsAvionicsCommon/providers/ExtendedClockProvider';
+import { FcuBusProvider } from 'instruments/src/PFD/shared/FcuBusProvider';
+import { FgBusProvider } from 'instruments/src/PFD/shared/FgBusProvider';
 import { getDisplayIndex, PFDComponent } from './PFD';
 import { AdirsValueProvider } from '../MsfsAvionicsCommon/AdirsValueProvider';
 import { ArincValueProvider } from './shared/ArincValueProvider';
 import { PFDSimvarPublisher, PFDSimvars } from './shared/PFDSimvarPublisher';
-import { SimplaneValueProvider } from './shared/SimplaneValueProvider';
 
 import './style.scss';
 
+// TODO move this whole thing to InstrumentBackplane and GameStateProvider
+
 class A32NX_PFD extends BaseInstrument {
-    private bus: EventBus;
+  private readonly bus = new ArincEventBus();
 
-    private simVarPublisher: PFDSimvarPublisher;
+  private readonly backplane = new InstrumentBackplane();
 
-    private readonly hEventPublisher;
+  private readonly simVarPublisher = new PFDSimvarPublisher(this.bus);
 
-    private readonly arincProvider: ArincValueProvider;
+  private readonly hEventPublisher = new HEventPublisher(this.bus);
 
-    private readonly simplaneValueProvider: SimplaneValueProvider;
+  private readonly arincProvider = new ArincValueProvider(this.bus);
 
-    private readonly clock: Clock;
+  private readonly fgBusProvider = new FgBusProvider(this.bus);
 
-    private adirsValueProvider: AdirsValueProvider<PFDSimvars>;
+  private readonly fcuBusProvider = new FcuBusProvider(this.bus);
 
-    private readonly displayManagementComputer: DisplayManagementComputer;
+  private readonly clock = new Clock(this.bus);
 
-    /**
-     * "mainmenu" = 0
-     * "loading" = 1
-     * "briefing" = 2
-     * "ingame" = 3
-     */
-    private gameState = 0;
+  // FIXME fit this into the normal backplane pattern
+  private adirsValueProvider: AdirsValueProvider<PFDSimvars>;
 
-    constructor() {
-        super();
-        this.bus = new EventBus();
-        this.simVarPublisher = new PFDSimvarPublisher(this.bus);
-        this.hEventPublisher = new HEventPublisher(this.bus);
-        this.arincProvider = new ArincValueProvider(this.bus);
-        this.simplaneValueProvider = new SimplaneValueProvider(this.bus);
-        this.clock = new Clock(this.bus);
-        this.displayManagementComputer = new DisplayManagementComputer(this.bus);
-    }
+  private readonly dmcPublisher = new DmcPublisher(this.bus);
 
-    get templateID(): string {
-        return 'A32NX_PFD';
-    }
+  // FIXME fit this into the normal backplane pattern
+  private fmsDataPublisher: FmsDataPublisher;
 
-    public getDeltaTime() {
-        return this.deltaTime;
-    }
+  private readonly ropRowOansPublisher = new RopRowOansPublisher(this.bus);
 
-    public onInteractionEvent(args: string[]): void {
-        this.hEventPublisher.dispatchHEvent(args[0]);
-    }
+  private readonly fwcPublisher = new FwcPublisher(this.bus);
 
-    public connectedCallback(): void {
-        super.connectedCallback();
+  private readonly extendedClockProvider = new ExtendedClockEventProvider(this.bus);
 
-        this.adirsValueProvider = new AdirsValueProvider(this.bus, this.simVarPublisher, getDisplayIndex() === 1 ? 'L' : 'R');
+  /**
+   * "mainmenu" = 0
+   * "loading" = 1
+   * "briefing" = 2
+   * "ingame" = 3
+   */
+  private gameState = 0;
 
-        this.arincProvider.init();
-        this.clock.init();
-        this.displayManagementComputer.init();
+  constructor() {
+    super();
 
-        this.simVarPublisher.subscribe('elec');
-        this.simVarPublisher.subscribe('elecFo');
+    this.backplane.addPublisher('PfdSimvars', this.simVarPublisher);
+    this.backplane.addPublisher('hEvent', this.hEventPublisher);
+    this.backplane.addInstrument('arincProvider', this.arincProvider);
+    this.backplane.addInstrument('fgBusProvider', this.fgBusProvider);
+    this.backplane.addInstrument('fcuBusProvider', this.fcuBusProvider);
+    this.backplane.addInstrument('Clock', this.clock);
+    this.backplane.addPublisher('Dmc', this.dmcPublisher);
+    this.backplane.addPublisher('RopRowOans', this.ropRowOansPublisher);
+    this.backplane.addPublisher('Fwc', this.fwcPublisher);
+    this.backplane.addInstrument('ExtendedClock', this.extendedClockProvider);
+  }
 
-        this.simVarPublisher.subscribe('coldDark');
-        this.simVarPublisher.subscribe('potentiometerCaptain');
-        this.simVarPublisher.subscribe('potentiometerFo');
-        this.simVarPublisher.subscribe('pitch');
-        this.simVarPublisher.subscribe('roll');
-        this.simVarPublisher.subscribe('magHeadingRaw');
-        this.simVarPublisher.subscribe('baroCorrectedAltitude');
-        this.simVarPublisher.subscribe('speed');
-        this.simVarPublisher.subscribe('noseGearCompressed');
-        this.simVarPublisher.subscribe('leftMainGearCompressed');
-        this.simVarPublisher.subscribe('rightMainGearCompressed');
-        this.simVarPublisher.subscribe('activeLateralMode');
-        this.simVarPublisher.subscribe('activeVerticalMode');
-        this.simVarPublisher.subscribe('fmaModeReversion');
-        this.simVarPublisher.subscribe('fmaSpeedProtection');
-        this.simVarPublisher.subscribe('AThrMode');
-        this.simVarPublisher.subscribe('apVsSelected');
-        this.simVarPublisher.subscribe('approachCapability');
-        this.simVarPublisher.subscribe('ap1Active');
-        this.simVarPublisher.subscribe('ap2Active');
-        this.simVarPublisher.subscribe('fmaVerticalArmed');
-        this.simVarPublisher.subscribe('fmaLateralArmed');
-        this.simVarPublisher.subscribe('fd1Active');
-        this.simVarPublisher.subscribe('fd2Active');
-        this.simVarPublisher.subscribe('athrStatus');
-        this.simVarPublisher.subscribe('athrModeMessage');
-        this.simVarPublisher.subscribe('machPreselVal');
-        this.simVarPublisher.subscribe('speedPreselVal');
-        this.simVarPublisher.subscribe('mda');
-        this.simVarPublisher.subscribe('dh');
-        this.simVarPublisher.subscribe('attHdgKnob');
-        this.simVarPublisher.subscribe('airKnob');
-        this.simVarPublisher.subscribe('vsBaro');
-        this.simVarPublisher.subscribe('vsInert');
-        this.simVarPublisher.subscribe('fdYawCommand');
-        this.simVarPublisher.subscribe('fdBank');
-        this.simVarPublisher.subscribe('fdPitch');
-        this.simVarPublisher.subscribe('hasLoc');
-        this.simVarPublisher.subscribe('hasDme');
-        this.simVarPublisher.subscribe('navIdent');
-        this.simVarPublisher.subscribe('navFreq');
-        this.simVarPublisher.subscribe('dme');
-        this.simVarPublisher.subscribe('navRadialError');
-        this.simVarPublisher.subscribe('hasGlideslope');
-        this.simVarPublisher.subscribe('glideSlopeError');
-        this.simVarPublisher.subscribe('markerBeacon');
-        this.simVarPublisher.subscribe('v1');
-        this.simVarPublisher.subscribe('fwcFlightPhase');
-        this.simVarPublisher.subscribe('fmgcFlightPhase');
+  get templateID(): string {
+    return 'A32NX_PFD';
+  }
 
-        this.simVarPublisher.subscribe('vr');
+  public getDeltaTime() {
+    return this.deltaTime;
+  }
 
-        this.simVarPublisher.subscribe('isAltManaged');
+  public onInteractionEvent(args: string[]): void {
+    this.hEventPublisher.dispatchHEvent(args[0]);
+  }
 
-        this.simVarPublisher.subscribe('mach');
-        this.simVarPublisher.subscribe('flapHandleIndex');
+  public connectedCallback(): void {
+    super.connectedCallback();
 
-        this.simVarPublisher.subscribe('transAlt');
-        this.simVarPublisher.subscribe('transAltAppr');
+    this.adirsValueProvider = new AdirsValueProvider(
+      this.bus,
+      this.simVarPublisher,
+      getDisplayIndex() === 1 ? 'L' : 'R',
+    );
 
-        this.simVarPublisher.subscribe('magTrackRaw');
-        this.simVarPublisher.subscribe('selectedHeading');
-        this.simVarPublisher.subscribe('showSelectedHeading');
-        this.simVarPublisher.subscribe('altConstraint');
-        this.simVarPublisher.subscribe('trkFpaActive');
-        this.simVarPublisher.subscribe('aoa');
+    const stateSubject = Subject.create<'L' | 'R'>(getDisplayIndex() === 1 ? 'L' : 'R');
+    this.fmsDataPublisher = new FmsDataPublisher(this.bus, stateSubject);
 
-        this.simVarPublisher.subscribe('selectedFpa');
-        this.simVarPublisher.subscribe('targetSpeedManaged');
-        this.simVarPublisher.subscribe('ilsCourse');
-        this.simVarPublisher.subscribe('tla1');
-        this.simVarPublisher.subscribe('tla2');
-        this.simVarPublisher.subscribe('metricAltToggle');
-        this.simVarPublisher.subscribe('landingElevation');
+    this.backplane.init();
 
-        this.simVarPublisher.subscribe('tcasState');
-        this.simVarPublisher.subscribe('tcasCorrective');
-        this.simVarPublisher.subscribe('tcasRedZoneL');
-        this.simVarPublisher.subscribe('tcasRedZoneH');
-        this.simVarPublisher.subscribe('tcasGreenZoneL');
-        this.simVarPublisher.subscribe('tcasGreenZoneH');
-        this.simVarPublisher.subscribe('tcasFail');
-        this.simVarPublisher.subscribe('engOneRunning');
-        this.simVarPublisher.subscribe('engTwoRunning');
-        this.simVarPublisher.subscribe('expediteMode');
-        this.simVarPublisher.subscribe('setHoldSpeed');
-        this.simVarPublisher.subscribe('trkFpaDeselectedTCAS');
-        this.simVarPublisher.subscribe('tcasRaInhibited');
-        this.simVarPublisher.subscribe('groundSpeed');
-        this.simVarPublisher.subscribe('radioAltitude1');
-        this.simVarPublisher.subscribe('radioAltitude2');
+    FSComponent.render(<PFDComponent bus={this.bus} instrument={this} />, document.getElementById('PFD_CONTENT'));
 
-        this.simVarPublisher.subscribe('crzAltMode');
-        this.simVarPublisher.subscribe('tcasModeDisarmed');
-        this.simVarPublisher.subscribe('flexTemp');
-        this.simVarPublisher.subscribe('autoBrakeMode');
-        this.simVarPublisher.subscribe('autoBrakeActive');
-        this.simVarPublisher.subscribe('autoBrakeDecel');
-        this.simVarPublisher.subscribe('fpaRaw');
-        this.simVarPublisher.subscribe('daRaw');
-        this.simVarPublisher.subscribe('latAccRaw');
-        this.simVarPublisher.subscribe('ls1Button');
-        this.simVarPublisher.subscribe('ls2Button');
-        this.simVarPublisher.subscribe('xtk');
-        this.simVarPublisher.subscribe('ldevRequestLeft');
-        this.simVarPublisher.subscribe('ldevRequestRight');
-        this.simVarPublisher.subscribe('landingElevation1Raw');
-        this.simVarPublisher.subscribe('landingElevation2Raw');
+    // Remove "instrument didn't load" text
+    document.getElementById('PFD_CONTENT').querySelector(':scope > h1').remove();
+  }
 
-        this.simVarPublisher.subscribe('fcdc1DiscreteWord1Raw');
-        this.simVarPublisher.subscribe('fcdc2DiscreteWord1Raw');
-        this.simVarPublisher.subscribe('fcdc1DiscreteWord2Raw');
-        this.simVarPublisher.subscribe('fcdc2DiscreteWord2Raw');
-
-        this.simVarPublisher.subscribe('fcdc1CaptPitchCommandRaw');
-        this.simVarPublisher.subscribe('fcdc2CaptPitchCommandRaw');
-        this.simVarPublisher.subscribe('fcdc1FoPitchCommandRaw');
-        this.simVarPublisher.subscribe('fcdc2FoPitchCommandRaw');
-        this.simVarPublisher.subscribe('fcdc1CaptRollCommandRaw');
-        this.simVarPublisher.subscribe('fcdc2CaptRollCommandRaw');
-        this.simVarPublisher.subscribe('fcdc1FoRollCommandRaw');
-        this.simVarPublisher.subscribe('fcdc2FoRollCommandRaw');
-
-        this.simVarPublisher.subscribe('fac1Healthy');
-        this.simVarPublisher.subscribe('fac2Healthy');
-        this.simVarPublisher.subscribe('fac1VAlphaProtRaw');
-        this.simVarPublisher.subscribe('fac2VAlphaProtRaw');
-        this.simVarPublisher.subscribe('fac1VAlphaMaxRaw');
-        this.simVarPublisher.subscribe('fac2VAlphaMaxRaw');
-        this.simVarPublisher.subscribe('fac1VStallWarnRaw');
-        this.simVarPublisher.subscribe('fac2VStallWarnRaw');
-        this.simVarPublisher.subscribe('fac1VMaxRaw');
-        this.simVarPublisher.subscribe('fac2VMaxRaw');
-        this.simVarPublisher.subscribe('fac1VFeNextRaw');
-        this.simVarPublisher.subscribe('fac2VFeNextRaw');
-        this.simVarPublisher.subscribe('fac1VCTrendRaw');
-        this.simVarPublisher.subscribe('fac2VCTrendRaw');
-        this.simVarPublisher.subscribe('fac1VManRaw');
-        this.simVarPublisher.subscribe('fac2VManRaw');
-        this.simVarPublisher.subscribe('fac1V4Raw');
-        this.simVarPublisher.subscribe('fac2V4Raw');
-        this.simVarPublisher.subscribe('fac1V3Raw');
-        this.simVarPublisher.subscribe('fac2V3Raw');
-        this.simVarPublisher.subscribe('fac1VLsRaw');
-        this.simVarPublisher.subscribe('fac2VLsRaw');
-        this.simVarPublisher.subscribe('fac1EstimatedBetaRaw');
-        this.simVarPublisher.subscribe('fac2EstimatedBetaRaw');
-        this.simVarPublisher.subscribe('fac1BetaTargetRaw');
-        this.simVarPublisher.subscribe('fac2BetaTargetRaw');
-        this.simVarPublisher.subscribe('trueRefPushbutton');
-        this.simVarPublisher.subscribe('irMaintWordRaw');
-        this.simVarPublisher.subscribe('trueHeadingRaw');
-        this.simVarPublisher.subscribe('trueTrackRaw');
-        this.simVarPublisher.subscribe('slatPosLeft');
-        this.simVarPublisher.subscribe('fm1NavDiscrete');
-
-        FSComponent.render(<PFDComponent bus={this.bus} instrument={this} />, document.getElementById('PFD_CONTENT'));
-
-        // Remove "instrument didn't load" text
-        document.getElementById('PFD_CONTENT').querySelector(':scope > h1').remove();
-    }
-
-    /**
+  /**
    * A callback called when the instrument gets a frame update.
    */
-    public Update(): void {
-        super.Update();
+  public Update(): void {
+    super.Update();
 
-        if (this.gameState !== 3) {
-            const gamestate = this.getGameState();
-            if (gamestate === 3) {
-                this.simVarPublisher.startPublish();
-                this.hEventPublisher.startPublish();
-                this.adirsValueProvider.start();
-            }
-            this.gameState = gamestate;
-        } else {
-            this.simVarPublisher.onUpdate();
-            this.simplaneValueProvider.onUpdate();
-            this.clock.onUpdate();
-        }
+    this.backplane.onUpdate();
+
+    if (this.gameState !== 3) {
+      const gamestate = this.getGameState();
+      if (gamestate === 3) {
+        this.adirsValueProvider.start();
+        this.fmsDataPublisher.startPublish();
+      }
+      this.gameState = gamestate;
+    } else {
+      this.fmsDataPublisher.onUpdate();
     }
+  }
 }
 
 registerInstrument('a32nx-pfd', A32NX_PFD);
