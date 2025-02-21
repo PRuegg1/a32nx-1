@@ -1,10 +1,10 @@
 use crate::{
+    failures::{Failure, FailureType},
     pneumatic::{EngineModeSelector, EngineState, PneumaticValveSignal},
     shared::{
-        pid::PidController, CabinAltitude, CabinSimulation, ControllerSignal, ElectricalBusType,
-        ElectricalBuses, EngineBleedPushbutton, EngineCorrectedN1, EngineFirePushButtons,
-        EngineStartState, LgciuWeightOnWheels, PackFlowValveState, PneumaticBleed,
-        PressurizationOverheadShared,
+        pid::PidController, CabinAltitude, CabinSimulation, ControllerSignal, DelayedTrueLogicGate,
+        ElectricalBusType, EngineCorrectedN1, EngineFirePushButtons, EngineStartState,
+        LgciuWeightOnWheels, PackFlowValveState, PneumaticBleed,
     },
     simulation::{
         InitContext, SimulationElement, SimulationElementVisitor, SimulatorWriter, UpdateContext,
@@ -13,65 +13,114 @@ use crate::{
 };
 
 use super::{
-    AdirsToAirCondInterface, AirConditioningSystemOverhead, DuctTemperature, OverheadFlowSelector,
-    PackFlow, PackFlowControllers, TrimAirSystem, ZoneType,
+    AdirsToAirCondInterface, AirConditioningOverheadShared, CabinFansSignal, Channel,
+    DuctTemperature, OperatingChannel, OverheadFlowSelector, PackFlow, PackFlowControllers,
+    PackFlowValveSignal, PressurizationOverheadShared, TrimAirControllers, TrimAirSystem, ZoneType,
 };
 
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 use uom::si::{
     f64::*,
     length::foot,
     mass_rate::kilogram_per_second,
+    pressure::psi,
     ratio::{percent, ratio},
     thermodynamic_temperature::{degree_celsius, kelvin},
     velocity::knot,
 };
 
-#[derive(PartialEq, Clone, Copy)]
-enum ACSCActiveComputer {
-    Primary,
-    Secondary,
-    None,
+#[derive(Eq, PartialEq, Clone, Copy)]
+pub enum AcscId {
+    Acsc1(Channel),
+    Acsc2(Channel),
 }
 
-pub(super) struct AirConditioningSystemController<const ZONES: usize, const ENGINES: usize> {
+impl From<AcscId> for usize {
+    fn from(value: AcscId) -> Self {
+        match value {
+            AcscId::Acsc1(_) => 1,
+            AcscId::Acsc2(_) => 2,
+        }
+    }
+}
+
+impl Display for AcscId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcscId::Acsc1(_) => write!(f, "1"),
+            AcscId::Acsc2(_) => write!(f, "2"),
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum AcscFault {
+    OneChannelFault,
+    BothChannelsFault,
+}
+
+/// A320 ACSC P/N S1803A0001-xx
+pub struct AirConditioningSystemController<const ZONES: usize, const ENGINES: usize> {
+    id: AcscId,
+    active_channel: OperatingChannel,
+    stand_by_channel: OperatingChannel,
+
     aircraft_state: AirConditioningStateManager,
-    zone_controller: Vec<ZoneController<ZONES>>,
-    pack_flow_controller: [PackFlowController<ZONES, ENGINES>; 2],
+    zone_controller: Vec<ZoneController>,
+    pack_flow_controller: PackFlowController<ENGINES>,
     trim_air_system_controller: TrimAirSystemController<ZONES, ENGINES>,
     cabin_fans_controller: CabinFanController<ZONES>,
-    primary_powered_by: Vec<ElectricalBusType>,
-    primary_is_powered: bool,
-    secondary_powered_by: Vec<ElectricalBusType>,
-    secondary_is_powered: bool,
+
+    internal_failure: Option<AcscFault>,
 }
 
 impl<const ZONES: usize, const ENGINES: usize> AirConditioningSystemController<ZONES, ENGINES> {
     pub fn new(
         context: &mut InitContext,
+        id: AcscId,
         cabin_zone_ids: &[ZoneType; ZONES],
-        primary_powered_by: Vec<ElectricalBusType>,
-        secondary_powered_by: Vec<ElectricalBusType>,
+        powered_by: [[ElectricalBusType; 2]; 2],
     ) -> Self {
-        let zone_controller = cabin_zone_ids
-            .iter()
-            .map(ZoneController::new)
-            .collect::<Vec<ZoneController<ZONES>>>();
-        Self {
-            aircraft_state: AirConditioningStateManager::new(),
-            zone_controller,
-            pack_flow_controller: [
-                PackFlowController::new(context, Pack(1)),
-                PackFlowController::new(context, Pack(2)),
+        let failure_types = match id {
+            AcscId::Acsc1(_) => [
+                FailureType::Acsc(AcscId::Acsc1(Channel::ChannelOne)),
+                FailureType::Acsc(AcscId::Acsc1(Channel::ChannelTwo)),
             ],
-            trim_air_system_controller: TrimAirSystemController::new(context),
+            AcscId::Acsc2(_) => [
+                FailureType::Acsc(AcscId::Acsc2(Channel::ChannelOne)),
+                FailureType::Acsc(AcscId::Acsc2(Channel::ChannelTwo)),
+            ],
+        };
+
+        Self {
+            id,
+
+            active_channel: OperatingChannel::new(1, Some(failure_types[0]), &powered_by[0]),
+            stand_by_channel: OperatingChannel::new(2, Some(failure_types[1]), &powered_by[1]),
+
+            aircraft_state: AirConditioningStateManager::new(),
+            zone_controller: Self::zone_controller_initiation(id, cabin_zone_ids),
+            pack_flow_controller: PackFlowController::new(context, Pack(id.into())),
+            trim_air_system_controller: TrimAirSystemController::new(),
             cabin_fans_controller: CabinFanController::new(),
 
-            primary_powered_by,
-            primary_is_powered: false,
-            secondary_powered_by,
-            secondary_is_powered: false,
+            internal_failure: None,
+        }
+    }
+
+    fn zone_controller_initiation(
+        id: AcscId,
+        cabin_zone_ids: &[ZoneType; ZONES],
+    ) -> Vec<ZoneController> {
+        // ACSC 1 regulates the cockpit temperature and ACSC 2 the cabin zones
+        if matches!(id, AcscId::Acsc1(_)) {
+            vec![ZoneController::new(cabin_zone_ids[0])]
+        } else {
+            cabin_zone_ids[1..]
+                .iter()
+                .map(|zone| ZoneController::new(*zone))
+                .collect::<Vec<ZoneController>>()
         }
     }
 
@@ -79,46 +128,43 @@ impl<const ZONES: usize, const ENGINES: usize> AirConditioningSystemController<Z
         &mut self,
         context: &UpdateContext,
         adirs: &impl AdirsToAirCondInterface,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
+        acs_overhead: &impl AirConditioningOverheadShared,
         cabin_temperature: &impl CabinSimulation,
         engines: [&impl EngineCorrectedN1; ENGINES],
         engine_fire_push_buttons: &impl EngineFirePushButtons,
         pneumatic: &(impl EngineStartState + PackFlowValveState + PneumaticBleed),
-        pneumatic_overhead: &impl EngineBleedPushbutton<ENGINES>,
         pressurization: &impl CabinAltitude,
         pressurization_overhead: &impl PressurizationOverheadShared,
         lgciu: [&impl LgciuWeightOnWheels; 2],
         trim_air_system: &TrimAirSystem<ZONES, ENGINES>,
     ) {
+        self.fault_determination();
+
         let ground_speed = self.ground_speed(adirs).unwrap_or_default();
         self.aircraft_state = self
             .aircraft_state
             .update(context, ground_speed, &engines, lgciu);
 
-        let operation_mode = self.operation_mode_determination();
+        self.pack_flow_controller.update(
+            context,
+            &self.aircraft_state,
+            acs_overhead,
+            engine_fire_push_buttons,
+            pneumatic,
+            pressurization,
+            pressurization_overhead,
+            !self.both_channels_failure(),
+        );
 
-        for pack_flow_controller in self.pack_flow_controller.iter_mut() {
-            pack_flow_controller.update(
-                context,
-                &self.aircraft_state,
-                acs_overhead,
-                engines,
-                engine_fire_push_buttons,
-                pneumatic,
-                pneumatic_overhead,
-                pressurization,
-                pressurization_overhead,
-                operation_mode,
-            );
-        }
-
-        for (index, zone) in self.zone_controller.iter_mut().enumerate() {
+        let both_channels_failure = self.both_channels_failure();
+        for zone in self.zone_controller.iter_mut() {
             zone.update(
                 context,
+                self.id,
                 acs_overhead,
-                cabin_temperature.cabin_temperature()[index],
+                !both_channels_failure,
+                cabin_temperature.cabin_temperature(),
                 pressurization,
-                &operation_mode,
             )
         }
 
@@ -126,25 +172,60 @@ impl<const ZONES: usize, const ENGINES: usize> AirConditioningSystemController<Z
             context,
             acs_overhead,
             &self.duct_demand_temperature(),
+            !both_channels_failure,
             &self.pack_flow_controller,
-            operation_mode,
             pneumatic,
             trim_air_system,
         );
 
-        self.cabin_fans_controller
-            .update(acs_overhead, operation_mode);
+        self.cabin_fans_controller.update(acs_overhead);
     }
 
-    fn operation_mode_determination(&self) -> ACSCActiveComputer {
-        // TODO: Add failures
-        if self.primary_is_powered {
-            ACSCActiveComputer::Primary
-        } else if self.secondary_is_powered {
-            ACSCActiveComputer::Secondary
-        } else {
-            ACSCActiveComputer::None
-        }
+    fn fault_determination(&mut self) {
+        self.active_channel.update_fault();
+        self.stand_by_channel.update_fault();
+
+        self.internal_failure = match (
+            self.active_channel.has_fault(),
+            self.stand_by_channel.has_fault(),
+        ) {
+            (true, true) => Some(AcscFault::BothChannelsFault),
+            (false, false) => None,
+            (ac, _) => {
+                if ac {
+                    self.switch_active_channel();
+                }
+                Some(AcscFault::OneChannelFault)
+            }
+        };
+    }
+
+    fn switch_active_channel(&mut self) {
+        std::mem::swap(&mut self.stand_by_channel, &mut self.active_channel);
+    }
+
+    pub fn active_channel_1(&self) -> bool {
+        matches!(self.active_channel.id(), Channel::ChannelOne)
+    }
+
+    pub fn channel_1_inop(&self) -> bool {
+        [&self.active_channel, &self.stand_by_channel]
+            .iter()
+            .find(|channel| matches!(channel.id(), Channel::ChannelOne))
+            .unwrap()
+            .has_fault()
+    }
+
+    pub fn channel_2_inop(&self) -> bool {
+        [&self.active_channel, &self.stand_by_channel]
+            .iter()
+            .find(|channel| matches!(channel.id(), Channel::ChannelTwo))
+            .unwrap()
+            .has_fault()
+    }
+
+    pub fn both_channels_failure(&self) -> bool {
+        self.internal_failure == Some(AcscFault::BothChannelsFault)
     }
 
     fn ground_speed(&self, adirs: &impl AdirsToAirCondInterface) -> Option<Velocity> {
@@ -154,34 +235,74 @@ impl<const ZONES: usize, const ENGINES: usize> AirConditioningSystemController<Z
             .find_map(|&adiru_number| adirs.ground_speed(adiru_number).normal_value())
     }
 
-    pub(super) fn pack_fault_determination(
-        &self,
-        pneumatic: &impl PackFlowValveState,
-    ) -> [bool; 2] {
-        [
-            self.pack_flow_controller[Pack(1).to_index()].fcv_status_determination(pneumatic),
-            self.pack_flow_controller[Pack(2).to_index()].fcv_status_determination(pneumatic),
-        ]
+    pub fn pack_fault_determination(&self) -> bool {
+        self.pack_flow_controller.fcv_fault_determination() || self.both_channels_failure()
     }
 
-    pub(super) fn trim_air_valve_controllers(&self, zone_id: usize) -> TrimAirValveController {
-        self.trim_air_system_controller
-            .trim_air_valve_controllers(zone_id)
-    }
-
-    pub(super) fn cabin_fans_controller(&self) -> CabinFanController<ZONES> {
+    pub fn cabin_fans_controller(&self) -> CabinFanController<ZONES> {
         self.cabin_fans_controller
     }
 
-    pub(super) fn individual_pack_flow(&self, pack_id: Pack) -> MassRate {
-        self.pack_flow_controller[pack_id.to_index()].pack_flow()
+    pub fn individual_pack_flow(&self) -> MassRate {
+        self.pack_flow_controller.pack_flow()
     }
 
-    pub(super) fn duct_demand_temperature(&self) -> Vec<ThermodynamicTemperature> {
+    pub fn trim_air_pressure_regulating_valve_controller(
+        &self,
+    ) -> TrimAirPressureRegulatingValveController {
+        self.trim_air_system_controller.taprv_controller()
+    }
+
+    pub fn trim_air_pressure_regulating_valve_is_open(&self) -> bool {
+        self.trim_air_system_controller.tarpv_is_open()
+    }
+
+    pub fn duct_overheat(&self, zone_id: usize) -> bool {
+        self.trim_air_system_controller.duct_overheat(zone_id)
+    }
+
+    pub fn hot_air_pb_fault_light_determination(&self) -> bool {
+        self.trim_air_system_controller.duct_overheat_monitor()
+    }
+
+    pub fn galley_fan_fault(&self) -> bool {
         self.zone_controller
             .iter()
-            .map(|zone| zone.duct_demand_temperature())
-            .collect()
+            .any(|zone| zone.galley_fan_fault())
+    }
+
+    pub fn taprv_position_disagrees(&self) -> bool {
+        self.trim_air_system_controller
+            .taprv_disagree_status_monitor()
+    }
+}
+
+impl<const ZONES: usize, const ENGINES: usize> DuctTemperature
+    for AirConditioningSystemController<ZONES, ENGINES>
+{
+    /// This function needs to return a Vector of size ZONES.
+    ///
+    /// Because the `ZoneController` is different for each ACSC, we create a vector with "dummy" data for the zones
+    /// not being calculated by the relevant ACSC.
+    ///
+    /// ACSC1 calculates the duct demand temperature of the cockpit.
+    ///
+    /// ACSC2 calculates the duct demand temperature of the fwd and aft cabin zones.
+    fn duct_demand_temperature(&self) -> Vec<ThermodynamicTemperature> {
+        let demand_temperature: Vec<ThermodynamicTemperature> = self
+            .zone_controller
+            .iter()
+            .map(|zone| zone.duct_demand_temperature()[0])
+            .collect();
+
+        // Because each ACSC calculates the demand of its respective zone(s), we fill the vector for the trim air system
+        let mut filler_vector = [ThermodynamicTemperature::new::<degree_celsius>(24.); ZONES];
+        if matches!(self.id, AcscId::Acsc1(_)) {
+            filler_vector[..1].copy_from_slice(&demand_temperature);
+        } else {
+            filler_vector[1..].copy_from_slice(&demand_temperature);
+        };
+        filler_vector.to_vec()
     }
 }
 
@@ -189,15 +310,26 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlow
     for AirConditioningSystemController<ZONES, ENGINES>
 {
     fn pack_flow(&self) -> MassRate {
-        self.pack_flow_controller[0].pack_flow() + self.pack_flow_controller[1].pack_flow()
+        self.pack_flow_controller.pack_flow()
     }
 }
 
-impl<const ZONES: usize, const ENGINES: usize> PackFlowControllers<ZONES, ENGINES>
+impl<const ZONES: usize, const ENGINES: usize> PackFlowControllers
     for AirConditioningSystemController<ZONES, ENGINES>
 {
-    fn pack_flow_controller(&self, pack_id: Pack) -> PackFlowController<ZONES, ENGINES> {
-        self.pack_flow_controller[pack_id.to_index()]
+    type PackFlowControllerSignal = PackFlowController<ENGINES>;
+
+    fn pack_flow_controller(&self, _pack_id: usize) -> &Self::PackFlowControllerSignal {
+        &self.pack_flow_controller
+    }
+}
+
+impl<const ZONES: usize, const ENGINES: usize> TrimAirControllers
+    for AirConditioningSystemController<ZONES, ENGINES>
+{
+    fn trim_air_valve_controllers(&self, zone_id: usize) -> TrimAirValveController {
+        self.trim_air_system_controller
+            .trim_air_valve_controllers(zone_id)
     }
 }
 
@@ -205,23 +337,18 @@ impl<const ZONES: usize, const ENGINES: usize> SimulationElement
     for AirConditioningSystemController<ZONES, ENGINES>
 {
     fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
-        accept_iterable!(self.pack_flow_controller, visitor);
-        self.trim_air_system_controller.accept(visitor);
+        self.active_channel.accept(visitor);
+        self.stand_by_channel.accept(visitor);
+
+        self.pack_flow_controller.accept(visitor);
+        accept_iterable!(self.zone_controller, visitor);
 
         visitor.visit(self);
-    }
-
-    fn receive_power(&mut self, buses: &impl ElectricalBuses) {
-        self.primary_is_powered = self.primary_powered_by.iter().all(|&p| buses.is_powered(p));
-        self.secondary_is_powered = self
-            .secondary_powered_by
-            .iter()
-            .all(|&p| buses.is_powered(p));
     }
 }
 
 #[derive(Copy, Clone)]
-enum AirConditioningStateManager {
+pub enum AirConditioningStateManager {
     Initialisation(AirConditioningState<Initialisation>),
     OnGround(AirConditioningState<OnGround>),
     BeginTakeOff(AirConditioningState<BeginTakeOff>),
@@ -234,11 +361,11 @@ enum AirConditioningStateManager {
 impl AirConditioningStateManager {
     const TAKEOFF_THRESHOLD_SPEED_KNOTS: f64 = 70.;
 
-    fn new() -> Self {
+    pub fn new() -> Self {
         AirConditioningStateManager::Initialisation(AirConditioningState::init())
     }
 
-    fn update(
+    pub fn update(
         mut self,
         context: &UpdateContext,
         ground_speed: Velocity,
@@ -272,6 +399,12 @@ impl AirConditioningStateManager {
     }
 }
 
+impl Default for AirConditioningStateManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 macro_rules! transition {
     ($from: ty, $to: tt) => {
         impl From<AirConditioningState<$from>> for AirConditioningState<$to> {
@@ -286,7 +419,7 @@ macro_rules! transition {
 }
 
 #[derive(Copy, Clone)]
-struct AirConditioningState<S> {
+pub struct AirConditioningState<S> {
     aircraft_state: std::marker::PhantomData<S>,
     timer: Duration,
 }
@@ -299,7 +432,7 @@ impl<S> AirConditioningState<S> {
 }
 
 #[derive(Copy, Clone)]
-struct Initialisation;
+pub struct Initialisation;
 
 impl AirConditioningState<Initialisation> {
     fn init() -> Self {
@@ -322,7 +455,7 @@ transition!(Initialisation, OnGround);
 transition!(Initialisation, InFlight);
 
 #[derive(Copy, Clone)]
-struct OnGround;
+pub struct OnGround;
 
 impl AirConditioningState<OnGround> {
     fn step(
@@ -346,7 +479,7 @@ transition!(OnGround, InFlight);
 transition!(OnGround, BeginTakeOff);
 
 #[derive(Copy, Clone)]
-struct BeginTakeOff;
+pub struct BeginTakeOff;
 
 impl AirConditioningState<BeginTakeOff> {
     fn step(
@@ -370,7 +503,7 @@ impl AirConditioningState<BeginTakeOff> {
 transition!(BeginTakeOff, EndTakeOff);
 
 #[derive(Copy, Clone)]
-struct EndTakeOff;
+pub struct EndTakeOff;
 
 impl AirConditioningState<EndTakeOff> {
     fn step(
@@ -391,7 +524,7 @@ impl AirConditioningState<EndTakeOff> {
 transition!(EndTakeOff, InFlight);
 
 #[derive(Copy, Clone)]
-struct InFlight;
+pub struct InFlight;
 
 impl AirConditioningState<InFlight> {
     fn step(
@@ -412,7 +545,7 @@ impl AirConditioningState<InFlight> {
 transition!(InFlight, BeginLanding);
 
 #[derive(Copy, Clone)]
-struct BeginLanding;
+pub struct BeginLanding;
 
 impl AirConditioningState<BeginLanding> {
     fn step(
@@ -436,7 +569,7 @@ impl AirConditioningState<BeginLanding> {
 transition!(BeginLanding, EndLanding);
 
 #[derive(Copy, Clone)]
-struct EndLanding;
+pub struct EndLanding;
 
 impl AirConditioningState<EndLanding> {
     fn step(
@@ -453,14 +586,16 @@ impl AirConditioningState<EndLanding> {
 
 transition!(EndLanding, OnGround);
 
-struct ZoneController<const ZONES: usize> {
-    zone_id: usize,
+pub struct ZoneController {
+    zone_id: ZoneType,
     duct_demand_temperature: ThermodynamicTemperature,
     zone_selected_temperature: ThermodynamicTemperature,
     pid_controller: PidController,
+
+    galley_fan_failure: Failure,
 }
 
-impl<const ZONES: usize> ZoneController<ZONES> {
+impl ZoneController {
     const K_ALTITUDE_CORRECTION_DEG_PER_FEET: f64 = 0.0000375; // deg/feet
     const UPPER_DUCT_TEMP_TRIGGER_HIGH_CELSIUS: f64 = 19.; // C
     const UPPER_DUCT_TEMP_TRIGGER_LOW_CELSIUS: f64 = 17.; // C
@@ -470,13 +605,16 @@ impl<const ZONES: usize> ZoneController<ZONES> {
     const LOWER_DUCT_TEMP_TRIGGER_LOW_CELSIUS: f64 = 26.; // C
     const LOWER_DUCT_TEMP_LIMIT_LOW_KELVIN: f64 = 275.15; // K
     const LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN: f64 = 281.15; // K
+    const CARGO_DUCT_TEMP_LIMIT_LOW_KELVIN: f64 = 275.15; // K
+    const CARGO_DUCT_TEMP_LIMIT_HIGH_KELVIN: f64 = 343.15; // K
     const SETPOINT_TEMP_KELVIN: f64 = 297.15; // K
+    const CARGO_SETPOINT_TEMP_KELVIN: f64 = 288.15; // K
     const KI_DUCT_DEMAND_CABIN: f64 = 0.05;
     const KI_DUCT_DEMAND_COCKPIT: f64 = 0.04;
     const KP_DUCT_DEMAND_CABIN: f64 = 3.5;
     const KP_DUCT_DEMAND_COCKPIT: f64 = 2.;
 
-    fn new(zone_type: &ZoneType) -> Self {
+    pub fn new(zone_type: ZoneType) -> Self {
         let pid_controller = match zone_type {
             ZoneType::Cockpit => {
                 PidController::new(
@@ -498,43 +636,55 @@ impl<const ZONES: usize> ZoneController<ZONES> {
                 Self::SETPOINT_TEMP_KELVIN,
                 1.,
             ),
+            ZoneType::Cargo(_) => PidController::new(
+                Self::KP_DUCT_DEMAND_CABIN,
+                Self::KI_DUCT_DEMAND_CABIN,
+                0.,
+                Self::CARGO_DUCT_TEMP_LIMIT_HIGH_KELVIN,
+                Self::CARGO_DUCT_TEMP_LIMIT_LOW_KELVIN,
+                Self::CARGO_SETPOINT_TEMP_KELVIN,
+                1.,
+            ),
         };
         Self {
-            zone_id: zone_type.id(),
+            zone_id: zone_type,
             duct_demand_temperature: ThermodynamicTemperature::new::<degree_celsius>(24.),
             zone_selected_temperature: ThermodynamicTemperature::new::<degree_celsius>(24.),
             pid_controller,
+
+            galley_fan_failure: Failure::new(FailureType::GalleyFans),
         }
     }
 
-    fn update(
+    pub fn update(
         &mut self,
         context: &UpdateContext,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
-        zone_measured_temperature: ThermodynamicTemperature,
+        acsc_id: AcscId,
+        acs_overhead: &impl AirConditioningOverheadShared,
+        is_enabled: bool,
+        zone_measured_temperature: Vec<ThermodynamicTemperature>,
         pressurization: &impl CabinAltitude,
-        operation_mode: &ACSCActiveComputer,
     ) {
-        self.zone_selected_temperature = if matches!(operation_mode, ACSCActiveComputer::Secondary)
-        {
-            // If the Zone controller is working on secondary power, the zones are controlled to
-            // 24 degrees by the secondary computer
+        self.zone_selected_temperature = if !is_enabled {
+            // If unpowered or failed, the zone is maintained at fixed temperature
             ThermodynamicTemperature::new::<degree_celsius>(24.)
+        } else if matches!(self.zone_id, ZoneType::Cargo(1)) {
+            acs_overhead.selected_cargo_temperature(self.zone_id)
         } else {
-            acs_overhead.selected_cabin_temperature(self.zone_id)
+            acs_overhead.selected_cabin_temperature(self.zone_id.id())
         };
-        self.duct_demand_temperature = if matches!(operation_mode, ACSCActiveComputer::None) {
-            // If unpowered or failed, the pack controller would take over and deliver a fixed 20deg
-            // for the cockpit and 10 for the cabin
-            // Simulated here until packs are modelled
-            ThermodynamicTemperature::new::<degree_celsius>(if self.zone_id == 0 {
-                20.
+        self.duct_demand_temperature =
+            if self.galley_fan_failure.is_active() && matches!(acsc_id, AcscId::Acsc2(_)) {
+                // Cabin zone temperature sensors are ventilated by air extracted by this fan, cabin temperature regulation is lost
+                // Cabin inlet duct is constant at 15C, cockpit air is unaffected
+                ThermodynamicTemperature::new::<degree_celsius>(15.)
             } else {
-                10.
-            })
-        } else {
-            self.calculate_duct_temp_demand(context, pressurization, zone_measured_temperature)
-        };
+                self.calculate_duct_temp_demand(
+                    context,
+                    pressurization,
+                    zone_measured_temperature[self.zone_id.id()],
+                )
+            };
     }
 
     fn calculate_duct_temp_demand(
@@ -543,8 +693,8 @@ impl<const ZONES: usize> ZoneController<ZONES> {
         pressurization: &impl CabinAltitude,
         zone_measured_temperature: ThermodynamicTemperature,
     ) -> ThermodynamicTemperature {
-        let altitude_correction: f64 =
-            pressurization.altitude().get::<foot>() * Self::K_ALTITUDE_CORRECTION_DEG_PER_FEET;
+        let altitude_correction: f64 = pressurization.altitude().get::<foot>().max(0.)
+            * Self::K_ALTITUDE_CORRECTION_DEG_PER_FEET;
         let corrected_selected_temp: f64 =
             self.zone_selected_temperature.get::<kelvin>() + altitude_correction;
 
@@ -583,8 +733,7 @@ impl<const ZONES: usize> ZoneController<ZONES> {
             {
                 Self::UPPER_DUCT_TEMP_LIMIT_HIGH_KELVIN
             } else {
-                let interpolation = (Self::UPPER_DUCT_TEMP_LIMIT_LOW_KELVIN
-                    - Self::UPPER_DUCT_TEMP_LIMIT_HIGH_KELVIN)
+                (Self::UPPER_DUCT_TEMP_LIMIT_LOW_KELVIN - Self::UPPER_DUCT_TEMP_LIMIT_HIGH_KELVIN)
                     / (Self::UPPER_DUCT_TEMP_TRIGGER_HIGH_CELSIUS
                         - Self::UPPER_DUCT_TEMP_TRIGGER_LOW_CELSIUS)
                     * (zone_measured_temperature.get::<kelvin>()
@@ -592,8 +741,7 @@ impl<const ZONES: usize> ZoneController<ZONES> {
                             Self::UPPER_DUCT_TEMP_TRIGGER_LOW_CELSIUS,
                         )
                         .get::<kelvin>())
-                    + Self::UPPER_DUCT_TEMP_LIMIT_HIGH_KELVIN;
-                interpolation
+                    + Self::UPPER_DUCT_TEMP_LIMIT_HIGH_KELVIN
             },
         )
     }
@@ -616,8 +764,7 @@ impl<const ZONES: usize> ZoneController<ZONES> {
             {
                 Self::LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN
             } else {
-                let interpolation = (Self::LOWER_DUCT_TEMP_LIMIT_LOW_KELVIN
-                    - Self::LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN)
+                (Self::LOWER_DUCT_TEMP_LIMIT_LOW_KELVIN - Self::LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN)
                     / (Self::LOWER_DUCT_TEMP_TRIGGER_HIGH_CELSIUS
                         - Self::LOWER_DUCT_TEMP_TRIGGER_LOW_CELSIUS)
                     * (zone_measured_temperature.get::<kelvin>()
@@ -625,28 +772,26 @@ impl<const ZONES: usize> ZoneController<ZONES> {
                             Self::LOWER_DUCT_TEMP_TRIGGER_LOW_CELSIUS,
                         )
                         .get::<kelvin>())
-                    + Self::LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN;
-                interpolation
+                    + Self::LOWER_DUCT_TEMP_LIMIT_HIGH_KELVIN
             },
         )
     }
 
-    fn duct_demand_temperature(&self) -> ThermodynamicTemperature {
-        self.duct_demand_temperature
+    fn galley_fan_fault(&self) -> bool {
+        self.galley_fan_failure.is_active()
     }
 }
 
-pub struct PackFlowValveSignal {
-    target_open_amount: Ratio,
+impl DuctTemperature for ZoneController {
+    fn duct_demand_temperature(&self) -> Vec<ThermodynamicTemperature> {
+        vec![self.duct_demand_temperature]
+    }
 }
 
-impl PneumaticValveSignal for PackFlowValveSignal {
-    fn new(target_open_amount: Ratio) -> Self {
-        Self { target_open_amount }
-    }
-
-    fn target_open_amount(&self) -> Ratio {
-        self.target_open_amount
+impl SimulationElement for ZoneController {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        self.galley_fan_failure.accept(visitor);
+        visitor.visit(self);
     }
 }
 
@@ -655,7 +800,7 @@ impl PneumaticValveSignal for PackFlowValveSignal {
 pub struct Pack(pub usize);
 
 impl Pack {
-    pub(super) fn to_index(self) -> usize {
+    pub fn to_index(self) -> usize {
         self.0 - 1
     }
 }
@@ -670,23 +815,31 @@ impl From<usize> for Pack {
     }
 }
 
-#[derive(Copy, Clone)]
-pub struct PackFlowController<const ZONES: usize, const ENGINES: usize> {
+impl From<Pack> for usize {
+    fn from(value: Pack) -> Self {
+        value.0
+    }
+}
+
+pub struct PackFlowController<const ENGINES: usize> {
     pack_flow_id: VariableIdentifier,
 
     id: usize,
+    is_enabled: bool,
     flow_demand: Ratio,
     fcv_open_allowed: bool,
     should_open_fcv: bool,
     pack_flow: MassRate,
     pack_flow_demand: MassRate,
     pid: PidController,
-    operation_mode: ACSCActiveComputer,
 
     fcv_timer_open: Duration,
+    fcv_failed_open_monitor: DelayedTrueLogicGate,
+    fcv_failed_closed_monitor: DelayedTrueLogicGate,
+    inlet_pressure_below_min: DelayedTrueLogicGate,
 }
 
-impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES> {
+impl<const ENGINES: usize> PackFlowController<ENGINES> {
     const PACK_START_TIME_SECOND: f64 = 30.;
     const PACK_START_FLOW_LIMIT: f64 = 100.;
     const APU_SUPPLY_FLOW_LIMIT: f64 = 120.;
@@ -697,20 +850,32 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
     const FLOW_CONSTANT_C: f64 = 0.5675; // kg/s
     const FLOW_CONSTANT_XCAB: f64 = 0.00001828; // kg(feet*s)
 
+    const PACK_INLET_PRESSURE_MIN_PSIG: f64 = 8.;
+    const FCV_FAILED_OPEN_TIME_LIMIT: Duration = Duration::from_secs(30);
+    const FCV_FAILED_CLOSED_TIME_LIMIT: Duration = Duration::from_secs(17);
+    const INLET_PRESSURE_BELOW_MIN_TIME: Duration = Duration::from_secs(5);
+
     fn new(context: &mut InitContext, pack_id: Pack) -> Self {
         Self {
             pack_flow_id: context.get_identifier(Self::pack_flow_id(pack_id.to_index())),
 
             id: pack_id.to_index(),
+            is_enabled: false,
             flow_demand: Ratio::default(),
             fcv_open_allowed: false,
             should_open_fcv: false,
             pack_flow: MassRate::default(),
             pack_flow_demand: MassRate::default(),
             pid: PidController::new(0.01, 0.1, 0., 0., 1., 0., 1.),
-            operation_mode: ACSCActiveComputer::None,
 
             fcv_timer_open: Duration::from_secs(0),
+            fcv_failed_open_monitor: DelayedTrueLogicGate::new(Self::FCV_FAILED_OPEN_TIME_LIMIT),
+            fcv_failed_closed_monitor: DelayedTrueLogicGate::new(
+                Self::FCV_FAILED_CLOSED_TIME_LIMIT,
+            ),
+            inlet_pressure_below_min: DelayedTrueLogicGate::new(
+                Self::INLET_PRESSURE_BELOW_MIN_TIME,
+            ),
         }
     }
 
@@ -722,59 +887,55 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
         &mut self,
         context: &UpdateContext,
         aircraft_state: &AirConditioningStateManager,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
-        engines: [&impl EngineCorrectedN1; ENGINES],
+        acs_overhead: &impl AirConditioningOverheadShared,
         engine_fire_push_buttons: &impl EngineFirePushButtons,
         pneumatic: &(impl EngineStartState + PackFlowValveState + PneumaticBleed),
-        pneumatic_overhead: &impl EngineBleedPushbutton<ENGINES>,
         pressurization: &impl CabinAltitude,
         pressurization_overhead: &impl PressurizationOverheadShared,
-        operation_mode: ACSCActiveComputer,
+        is_enabled: bool,
     ) {
         // TODO: Add overheat protection
-        self.operation_mode = operation_mode;
+        self.is_enabled = is_enabled;
         self.flow_demand = self.flow_demand_determination(aircraft_state, acs_overhead, pneumatic);
+        self.update_pressure_condition(context, pneumatic);
         self.fcv_open_allowed = self.fcv_open_allowed_determination(
             acs_overhead,
             engine_fire_push_buttons,
             pressurization_overhead,
             pneumatic,
         );
-        self.should_open_fcv =
-            self.fcv_open_allowed && self.can_move_fcv(engines, pneumatic, pneumatic_overhead);
+        self.should_open_fcv = self.fcv_open_allowed && !self.inlet_pressure_below_min.output();
         self.update_timer(context);
+        self.update_fcv_monitoring(context, pneumatic);
         self.pack_flow_demand = self.absolute_flow_calculation(pressurization);
 
         self.pid
             .change_setpoint(self.pack_flow_demand.get::<kilogram_per_second>());
         self.pid.next_control_output(
             pneumatic
-                .pack_flow_valve_air_flow(self.id)
+                .pack_flow_valve_air_flow(self.id + 1)
                 .get::<kilogram_per_second>(),
             Some(context.delta()),
         );
 
-        self.pack_flow = pneumatic.pack_flow_valve_air_flow(self.id);
+        self.pack_flow = pneumatic.pack_flow_valve_air_flow(self.id + 1);
     }
 
     fn pack_start_condition_determination(&self, pneumatic: &impl PackFlowValveState) -> bool {
         // Returns true when one of the packs is in start condition
-        pneumatic.pack_flow_valve_is_open(self.id)
+        pneumatic.pack_flow_valve_is_open(self.id + 1)
             && self.fcv_timer_open <= Duration::from_secs_f64(Self::PACK_START_TIME_SECOND)
     }
 
     fn flow_demand_determination(
         &self,
         aircraft_state: &AirConditioningStateManager,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
+        acs_overhead: &impl AirConditioningOverheadShared,
         pneumatic: &(impl EngineStartState + PackFlowValveState + PneumaticBleed),
     ) -> Ratio {
-        if matches!(self.operation_mode, ACSCActiveComputer::None) {
-            // If the computer is unpowered, return previous flow demand
-            return self.flow_demand;
-        } else if matches!(self.operation_mode, ACSCActiveComputer::Secondary) {
-            // If Secondary computer is active flow setting optimization is not available
-            return Ratio::new::<percent>(100.);
+        if !self.is_enabled {
+            // If both lanes of the ACSC fail, the PFV closes and the flow demand is 0
+            return Ratio::default();
         }
         let mut intermediate_flow: Ratio = acs_overhead.flow_selector_position().into();
         // TODO: Add "insufficient performance" based on Pack Mixer Temperature Demand
@@ -787,8 +948,8 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
                 intermediate_flow.max(Ratio::new::<percent>(Self::APU_SUPPLY_FLOW_LIMIT));
         }
         // Single pack operation determination
-        if (pneumatic.pack_flow_valve_is_open(self.id))
-            != (pneumatic.pack_flow_valve_is_open(1 - self.id))
+        if (pneumatic.pack_flow_valve_is_open(self.id + 1))
+            != (pneumatic.pack_flow_valve_is_open(2 - self.id))
         {
             intermediate_flow =
                 intermediate_flow.max(Ratio::new::<percent>(Self::ONE_PACK_FLOW_LIMIT));
@@ -804,7 +965,7 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
                 intermediate_flow.min(Ratio::new::<percent>(Self::FLOW_REDUCTION_LIMIT));
         }
         // If the flow control valve is closed the indication is in the Lo position
-        if !(pneumatic.pack_flow_valve_is_open(self.id)) {
+        if !(pneumatic.pack_flow_valve_is_open(self.id + 1)) {
             OverheadFlowSelector::Lo.into()
         } else {
             intermediate_flow.max(Ratio::new::<percent>(Self::BACKFLOW_LIMIT))
@@ -821,53 +982,25 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
 
     fn fcv_open_allowed_determination(
         &mut self,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
+        acs_overhead: &impl AirConditioningOverheadShared,
         engine_fire_push_buttons: &impl EngineFirePushButtons,
         pressurization_overhead: &impl PressurizationOverheadShared,
         pneumatic: &(impl PneumaticBleed + EngineStartState),
     ) -> bool {
-        match Pack::from(self.id + 1) {
-            Pack(1) => {
-                acs_overhead.pack_pushbuttons_state()[0]
-                    && !(pneumatic.left_engine_state() == EngineState::Starting)
-                    && (!(pneumatic.right_engine_state() == EngineState::Starting)
-                        || !pneumatic.engine_crossbleed_is_on())
-                    && (pneumatic.engine_mode_selector() != EngineModeSelector::Ignition
-                        || (pneumatic.left_engine_state() != EngineState::Off
-                            && pneumatic.left_engine_state() != EngineState::Shutting))
-                    && !engine_fire_push_buttons.is_released(1)
-                    && !pressurization_overhead.ditching_is_on()
-                // && ! pack 1 overheat
-            }
-            Pack(2) => {
-                acs_overhead.pack_pushbuttons_state()[1]
-                    && !(pneumatic.right_engine_state() == EngineState::Starting)
-                    && (!(pneumatic.left_engine_state() == EngineState::Starting)
-                        || !pneumatic.engine_crossbleed_is_on())
-                    && (pneumatic.engine_mode_selector() != EngineModeSelector::Ignition
-                        || (pneumatic.right_engine_state() != EngineState::Off
-                            && pneumatic.right_engine_state() != EngineState::Shutting))
-                    && !engine_fire_push_buttons.is_released(2)
-                    && !pressurization_overhead.ditching_is_on()
-                // && ! pack 2 overheat
-            }
-            _ => panic!("Pack ID number out of bounds."),
-        }
-    }
+        let is_onside_engine_start = pneumatic.engine_state(self.id + 1) == EngineState::Starting
+            || pneumatic.engine_state(self.id + 1) == EngineState::Restarting;
+        let is_offside_engine_start = pneumatic.engine_state(2 - self.id) == EngineState::Starting
+            || pneumatic.engine_state(2 - self.id) == EngineState::Restarting;
 
-    fn can_move_fcv(
-        &self,
-        engines: [&impl EngineCorrectedN1; ENGINES],
-        pneumatic: &(impl PneumaticBleed + EngineStartState),
-        pneumatic_overhead: &impl EngineBleedPushbutton<ENGINES>,
-    ) -> bool {
-        // Pneumatic overhead represents engine bleed pushbutton for left [0] and right [1] engine(s)
-        ((engines[self.id].corrected_n1() >= Ratio::new::<percent>(15.)
-            && pneumatic_overhead.engine_bleed_pushbuttons_are_auto()[(self.id == 1) as usize])
-            || (engines[(self.id == 0) as usize].corrected_n1() >= Ratio::new::<percent>(15.)
-                && pneumatic_overhead.engine_bleed_pushbuttons_are_auto()[(self.id == 0) as usize]
-                && pneumatic.engine_crossbleed_is_on()))
-            || pneumatic.apu_bleed_is_on()
+        acs_overhead.pack_pushbuttons_state()[self.id]
+            && !is_onside_engine_start
+            && (!is_offside_engine_start || !pneumatic.engine_crossbleed_is_on())
+            && (pneumatic.engine_mode_selector() != EngineModeSelector::Ignition
+                || (pneumatic.engine_state(self.id + 1) != EngineState::Off
+                    && pneumatic.engine_state(self.id + 1) != EngineState::Shutting))
+            && !engine_fire_push_buttons.is_released(1)
+            && !pressurization_overhead.ditching_is_on()
+        // && ! pack 1 overheat
     }
 
     fn update_timer(&mut self, context: &UpdateContext) {
@@ -878,61 +1011,102 @@ impl<const ZONES: usize, const ENGINES: usize> PackFlowController<ZONES, ENGINES
         }
     }
 
-    fn fcv_status_determination(&self, pneumatic: &impl PackFlowValveState) -> bool {
-        (pneumatic.pack_flow_valve_is_open(self.id)) != self.fcv_open_allowed
+    fn fcv_fault_determination(&self) -> bool {
+        self.fcv_disagree_status()
+            || (self.fcv_open_allowed && self.inlet_pressure_below_min.output())
+    }
+
+    fn update_pressure_condition(
+        &mut self,
+        context: &UpdateContext,
+        pneumatic: &impl PackFlowValveState,
+    ) {
+        self.inlet_pressure_below_min.update(
+            context,
+            pneumatic
+                .pack_flow_valve_inlet_pressure(self.id + 1)
+                .map_or(false, |p| {
+                    p.get::<psi>() < Self::PACK_INLET_PRESSURE_MIN_PSIG
+                }),
+        );
+    }
+
+    fn update_fcv_monitoring(
+        &mut self,
+        context: &UpdateContext,
+        pneumatic: &impl PackFlowValveState,
+    ) {
+        self.fcv_failed_open_monitor.update(
+            context,
+            !self.should_open_fcv && pneumatic.pack_flow_valve_is_open(self.id + 1),
+        );
+
+        self.fcv_failed_closed_monitor.update(
+            context,
+            self.should_open_fcv && !pneumatic.pack_flow_valve_is_open(self.id + 1),
+        );
+    }
+
+    fn fcv_disagree_status(&self) -> bool {
+        self.fcv_failed_open_monitor.output() || self.fcv_failed_closed_monitor.output()
     }
 }
 
-impl<const ZONES: usize, const ENGINES: usize> PackFlow for PackFlowController<ZONES, ENGINES> {
+impl<const ENGINES: usize> PackFlow for PackFlowController<ENGINES> {
     fn pack_flow(&self) -> MassRate {
         self.pack_flow
     }
 }
 
-impl<const ZONES: usize, const ENGINES: usize> ControllerSignal<PackFlowValveSignal>
-    for PackFlowController<ZONES, ENGINES>
-{
+impl<const ENGINES: usize> ControllerSignal<PackFlowValveSignal> for PackFlowController<ENGINES> {
     fn signal(&self) -> Option<PackFlowValveSignal> {
-        // Only send signal to move the valve if the computer is powered
-        if !matches!(self.operation_mode, ACSCActiveComputer::None) {
-            let target_open = Ratio::new::<ratio>(if self.should_open_fcv {
-                self.pid.output()
-            } else {
-                0.
-            });
-            Some(PackFlowValveSignal::new(target_open))
+        // If both lanes of the ACSC fail, the PFV closes
+        let target_open = if self.is_enabled && self.should_open_fcv {
+            Ratio::new::<ratio>(self.pid.output())
         } else {
-            None
-        }
+            Ratio::default()
+        };
+        Some(PackFlowValveSignal::new(target_open))
     }
 }
 
-impl<const ZONES: usize, const ENGINES: usize> SimulationElement
-    for PackFlowController<ZONES, ENGINES>
-{
+impl<const ENGINES: usize> SimulationElement for PackFlowController<ENGINES> {
     fn write(&self, writer: &mut SimulatorWriter) {
         writer.write(&self.pack_flow_id, self.flow_demand);
     }
 }
 
-#[derive(Clone, Copy)]
 struct TrimAirSystemController<const ZONES: usize, const ENGINES: usize> {
-    hot_air_is_enabled_id: VariableIdentifier,
-    hot_air_is_open_id: VariableIdentifier,
-
+    duct_overheat: [bool; ZONES],
     is_enabled: bool,
     is_open: bool,
+    overheat_timer: [Duration; ZONES],
+    taprv_open_disagrees: bool,
+    taprv_open_timer: Duration,
+    taprv_closed_disagrees: bool,
+    taprv_closed_timer: Duration,
+    taprv_controller: TrimAirPressureRegulatingValveController,
     trim_air_valve_controllers: [TrimAirValveController; ZONES],
 }
 
 impl<const ZONES: usize, const ENGINES: usize> TrimAirSystemController<ZONES, ENGINES> {
-    fn new(context: &mut InitContext) -> Self {
-        Self {
-            hot_air_is_enabled_id: context.get_identifier("HOT_AIR_VALVE_IS_ENABLED".to_owned()),
-            hot_air_is_open_id: context.get_identifier("HOT_AIR_VALVE_IS_OPEN".to_owned()),
+    const DUCT_OVERHEAT_SET_LIMIT: f64 = 88.; // Deg C
+    const DUCT_OVERHEAT_RESET_LIMIT: f64 = 70.; // Deg C
+    const TAPRV_OPEN_COMMAND_DISAGREE_TIMER: f64 = 30.; // seconds
+    const TAPRV_CLOSE_COMMAND_DISAGREE_TIMER: f64 = 14.; // seconds
+    const TIMER_RESET: f64 = 1.2; // seconds
 
+    fn new() -> Self {
+        Self {
+            duct_overheat: [false; ZONES],
             is_enabled: false,
             is_open: false,
+            overheat_timer: [Duration::default(); ZONES],
+            taprv_open_disagrees: false,
+            taprv_open_timer: Duration::default(),
+            taprv_closed_disagrees: false,
+            taprv_closed_timer: Duration::default(),
+            taprv_controller: TrimAirPressureRegulatingValveController::new(),
             trim_air_valve_controllers: [TrimAirValveController::new(); ZONES],
         }
     }
@@ -940,74 +1114,186 @@ impl<const ZONES: usize, const ENGINES: usize> TrimAirSystemController<ZONES, EN
     fn update(
         &mut self,
         context: &UpdateContext,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
+        acs_overhead: &impl AirConditioningOverheadShared,
         duct_demand_temperature: &[ThermodynamicTemperature],
-        pack_flow_controller: &[PackFlowController<ZONES, ENGINES>; 2],
-        operation_mode: ACSCActiveComputer,
+        is_enabled: bool,
+        pack_flow_controller: &PackFlowController<ENGINES>,
         pneumatic: &impl PackFlowValveState,
         trim_air_system: &TrimAirSystem<ZONES, ENGINES>,
     ) {
-        self.is_enabled = self
-            .trim_air_pressure_regulating_valve_status_determination(acs_overhead, operation_mode);
-
-        self.is_open = self.trim_air_pressure_regulating_valve_is_open_determination(
+        // If both lanes of the ACSC fail, the associated trim air valves close
+        self.is_enabled = self.trim_air_pressure_regulating_valve_status_determination(
+            acs_overhead,
+            trim_air_system.any_trim_air_valve_has_fault(),
+            is_enabled,
             pack_flow_controller,
             pneumatic,
-        ) && self.is_enabled;
+        );
+
+        self.taprv_controller.update(self.is_enabled);
+
+        self.is_open = trim_air_system.trim_air_pressure_regulating_valve_is_open(1);
 
         for (id, tav_controller) in self.trim_air_valve_controllers.iter_mut().enumerate() {
             tav_controller.update(
                 context,
-                self.is_enabled && self.is_open,
+                self.is_open,
                 trim_air_system.duct_temperature()[id],
                 duct_demand_temperature[id],
             )
         }
+
+        self.duct_overheat = (0..ZONES)
+            .map(|id| {
+                self.duct_zone_overheat_monitor(
+                    context,
+                    acs_overhead,
+                    trim_air_system.duct_temperature(),
+                    id,
+                )
+            })
+            .collect::<Vec<bool>>()
+            .try_into()
+            .unwrap_or_else(|v: Vec<bool>| {
+                panic!("Expected a Vec of length {} but it was {}", ZONES, v.len())
+            });
+
+        self.taprv_open_disagrees = self.taprv_open_command_disagree_monitor(context);
+        self.taprv_closed_disagrees = self.taprv_closed_command_disagree_monitor(context);
     }
 
     fn trim_air_pressure_regulating_valve_status_determination(
         &self,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
-        operation_mode: ACSCActiveComputer,
-    ) -> bool {
-        // TODO: Add overheat protection
-        // TODO: If more than one TAV fails, the system should be off
-        acs_overhead.hot_air_pushbutton_is_on() && operation_mode == ACSCActiveComputer::Primary
-    }
-
-    fn trim_air_pressure_regulating_valve_is_open_determination(
-        &self,
-        pack_flow_controller: &[PackFlowController<ZONES, ENGINES>; 2],
+        acs_overhead: &impl AirConditioningOverheadShared,
+        any_tav_has_fault: bool,
+        is_enabled: bool,
+        pack_flow_controller: &PackFlowController<ENGINES>,
         pneumatic: &impl PackFlowValveState,
     ) -> bool {
-        !pack_flow_controller
-            .iter()
-            .any(|pack| pack.pack_start_condition_determination(pneumatic))
-            && ((pneumatic.pack_flow_valve_is_open(0)) || (pneumatic.pack_flow_valve_is_open(1)))
+        acs_overhead.hot_air_pushbutton_is_on(1)
+            && is_enabled
+            && !pack_flow_controller.pack_start_condition_determination(pneumatic)
+            && ((pneumatic.pack_flow_valve_is_open(1)) || (pneumatic.pack_flow_valve_is_open(2)))
+            && !self.duct_overheat_monitor()
+            && !any_tav_has_fault
     }
 
     fn trim_air_valve_controllers(&self, zone_id: usize) -> TrimAirValveController {
         self.trim_air_valve_controllers[zone_id]
     }
 
-    fn is_enabled(&self) -> bool {
-        self.is_enabled
-    }
-
-    fn is_open(&self) -> bool {
+    fn tarpv_is_open(&self) -> bool {
         self.is_open
     }
-}
 
-impl<const ZONES: usize, const ENGINES: usize> SimulationElement
-    for TrimAirSystemController<ZONES, ENGINES>
-{
-    fn write(&self, writer: &mut SimulatorWriter) {
-        writer.write(&self.hot_air_is_enabled_id, self.is_enabled());
-        writer.write(&self.hot_air_is_open_id, self.is_open());
+    fn taprv_controller(&self) -> TrimAirPressureRegulatingValveController {
+        self.taprv_controller
+    }
+
+    fn duct_zone_overheat_monitor(
+        &mut self,
+        context: &UpdateContext,
+        acs_overhead: &impl AirConditioningOverheadShared,
+        duct_temperature: Vec<ThermodynamicTemperature>,
+        zone_id: usize,
+    ) -> bool {
+        if duct_temperature[zone_id]
+            > ThermodynamicTemperature::new::<degree_celsius>(Self::DUCT_OVERHEAT_SET_LIMIT)
+        {
+            if self.overheat_timer[zone_id] > Duration::from_secs_f64(Self::TIMER_RESET) {
+                true
+            } else {
+                self.overheat_timer[zone_id] += context.delta();
+                false
+            }
+        } else if self.duct_overheat[zone_id]
+            && ((duct_temperature[zone_id]
+                > ThermodynamicTemperature::new::<degree_celsius>(Self::DUCT_OVERHEAT_RESET_LIMIT))
+                || (duct_temperature[zone_id]
+                    <= ThermodynamicTemperature::new::<degree_celsius>(
+                        Self::DUCT_OVERHEAT_RESET_LIMIT,
+                    )
+                    && acs_overhead.hot_air_pushbutton_is_on(1)))
+        {
+            true
+        } else if self.duct_overheat[zone_id]
+            && duct_temperature[zone_id]
+                <= ThermodynamicTemperature::new::<degree_celsius>(Self::DUCT_OVERHEAT_RESET_LIMIT)
+            && !acs_overhead.hot_air_pushbutton_is_on(1)
+        {
+            self.overheat_timer[zone_id] = Duration::default();
+            false
+        } else {
+            self.duct_overheat[zone_id]
+        }
+    }
+
+    fn taprv_open_command_disagree_monitor(&mut self, context: &UpdateContext) -> bool {
+        if !self.is_enabled {
+            false
+        } else if !self.is_open && !self.taprv_open_disagrees {
+            if self.taprv_open_timer
+                > Duration::from_secs_f64(Self::TAPRV_OPEN_COMMAND_DISAGREE_TIMER)
+            {
+                self.taprv_open_timer = Duration::default();
+                true
+            } else {
+                self.taprv_open_timer += context.delta();
+                false
+            }
+        } else if self.is_open && self.taprv_open_disagrees {
+            if self.taprv_open_timer > Duration::from_secs_f64(Self::TIMER_RESET) {
+                self.taprv_open_timer = Duration::default();
+                false
+            } else {
+                self.taprv_open_timer += context.delta();
+                true
+            }
+        } else {
+            self.taprv_open_disagrees
+        }
+    }
+
+    fn taprv_closed_command_disagree_monitor(&mut self, context: &UpdateContext) -> bool {
+        if self.is_enabled {
+            false
+        } else if self.is_open && !self.taprv_closed_disagrees {
+            if self.taprv_closed_timer
+                > Duration::from_secs_f64(Self::TAPRV_CLOSE_COMMAND_DISAGREE_TIMER)
+            {
+                self.taprv_closed_timer = Duration::default();
+                true
+            } else {
+                self.taprv_closed_timer += context.delta();
+                false
+            }
+        } else if !self.is_open && self.taprv_closed_disagrees {
+            if self.taprv_closed_timer > Duration::from_secs_f64(Self::TIMER_RESET) {
+                self.taprv_closed_timer = Duration::default();
+                false
+            } else {
+                self.taprv_closed_timer += context.delta();
+                true
+            }
+        } else {
+            self.taprv_closed_disagrees
+        }
+    }
+
+    fn duct_overheat(&self, zone_id: usize) -> bool {
+        self.duct_overheat[zone_id]
+    }
+
+    fn duct_overheat_monitor(&self) -> bool {
+        self.duct_overheat.iter().any(|&overheat| overheat)
+    }
+
+    fn taprv_disagree_status_monitor(&self) -> bool {
+        self.taprv_open_disagrees || self.taprv_closed_disagrees
     }
 }
 
+#[derive(Default)]
 pub struct TrimAirValveSignal {
     target_open_amount: Ratio,
 }
@@ -1022,21 +1308,48 @@ impl PneumaticValveSignal for TrimAirValveSignal {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct TrimAirPressureRegulatingValveController {
+    should_open_taprv: bool,
+}
+
+impl TrimAirPressureRegulatingValveController {
+    pub fn new() -> Self {
+        Self {
+            should_open_taprv: false,
+        }
+    }
+
+    pub fn update(&mut self, should_open_taprv: bool) {
+        self.should_open_taprv = should_open_taprv
+    }
+}
+
+impl ControllerSignal<TrimAirValveSignal> for TrimAirPressureRegulatingValveController {
+    fn signal(&self) -> Option<TrimAirValveSignal> {
+        if self.should_open_taprv {
+            Some(TrimAirValveSignal::new(Ratio::new::<percent>(100.)))
+        } else {
+            Some(TrimAirValveSignal::new_closed())
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
-pub(super) struct TrimAirValveController {
+pub struct TrimAirValveController {
     tav_open_allowed: bool,
     pid: PidController,
 }
 
 impl TrimAirValveController {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             tav_open_allowed: false,
             pid: PidController::new(0.0002, 0.005, 0., 0., 1., 24., 1.),
         }
     }
 
-    fn update(
+    pub fn update(
         &mut self,
         context: &UpdateContext,
         open_allowed: bool,
@@ -1068,13 +1381,14 @@ impl ControllerSignal<TrimAirValveSignal> for TrimAirValveController {
     }
 }
 
-pub(super) enum CabinFansSignal {
-    On,
-    Off,
+impl Default for TrimAirValveController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CabinFanController<const ZONES: usize> {
+pub struct CabinFanController<const ZONES: usize> {
     is_enabled: bool,
 }
 
@@ -1083,13 +1397,8 @@ impl<const ZONES: usize> CabinFanController<ZONES> {
         Self { is_enabled: false }
     }
 
-    fn update(
-        &mut self,
-        acs_overhead: &AirConditioningSystemOverhead<ZONES>,
-        operation_mode: ACSCActiveComputer,
-    ) {
-        self.is_enabled =
-            acs_overhead.cabin_fans_is_on() && !matches!(operation_mode, ACSCActiveComputer::None);
+    fn update(&mut self, acs_overhead: &impl AirConditioningOverheadShared) {
+        self.is_enabled = acs_overhead.cabin_fans_is_on();
     }
 
     #[cfg(test)]
@@ -1101,7 +1410,7 @@ impl<const ZONES: usize> CabinFanController<ZONES> {
 impl<const ZONES: usize> ControllerSignal<CabinFansSignal> for CabinFanController<ZONES> {
     fn signal(&self) -> Option<CabinFansSignal> {
         if self.is_enabled {
-            Some(CabinFansSignal::On)
+            Some(CabinFansSignal::On(None))
         } else {
             Some(CabinFansSignal::Off)
         }
@@ -1114,21 +1423,21 @@ mod acs_controller_tests {
     use crate::{
         air_conditioning::{
             cabin_air::CabinAirSimulation, Air, AirConditioningPack, CabinFan, MixerUnit,
-            OutletAir, PressurizationConstants,
+            OutletAir, PressurizationConstants, VcmShared,
         },
         electrical::{test::TestElectricitySource, ElectricalBus, Electricity},
         overhead::{
-            AutoManFaultPushButton, AutoOffFaultPushButton, NormalOnPushButton, SpringLoadedSwitch,
+            AutoManFaultPushButton, NormalOnPushButton, OnOffFaultPushButton, SpringLoadedSwitch,
             ValueKnob,
         },
         pneumatic::{
             valve::{DefaultValve, PneumaticExhaust},
             ControllablePneumaticValve, EngineModeSelector, PneumaticContainer, PneumaticPipe,
-            Precooler,
+            Precooler, PressureTransducer,
         },
         shared::{
             arinc429::{Arinc429Word, SignStatus},
-            AverageExt, EngineBleedPushbutton, PneumaticValve, PotentialOrigin,
+            AverageExt, PneumaticValve, PotentialOrigin,
         },
         simulation::{
             test::{ReadByName, SimulationTestBed, TestBed, WriteByName},
@@ -1137,9 +1446,94 @@ mod acs_controller_tests {
         },
     };
     use uom::si::{
-        length::foot, pressure::psi, thermodynamic_temperature::degree_celsius, velocity::knot,
+        length::foot,
+        mass::kilogram,
+        pressure::{pascal, psi},
+        thermodynamic_temperature::degree_celsius,
+        velocity::knot,
         volume::cubic_meter,
+        volume_rate::liter_per_second,
     };
+
+    struct TestAcsOverhead {
+        selected_cabin_temperature: [ThermodynamicTemperature; 2],
+        pack_pbs: [OnOffFaultPushButton; 2],
+        hot_air_pb: bool,
+        cabin_fans_pb: bool,
+        flow_selector: OverheadFlowSelector,
+    }
+
+    impl TestAcsOverhead {
+        fn new(context: &mut InitContext) -> Self {
+            Self {
+                selected_cabin_temperature: [ThermodynamicTemperature::new::<degree_celsius>(24.);
+                    2],
+                pack_pbs: [
+                    OnOffFaultPushButton::new_on(context, "COND_PACK_1"),
+                    OnOffFaultPushButton::new_on(context, "COND_PACK_2"),
+                ],
+                hot_air_pb: true,
+                cabin_fans_pb: true,
+                flow_selector: OverheadFlowSelector::Norm,
+            }
+        }
+
+        fn set_pack_pushbutton_fault(&mut self, pb_has_fault: [bool; 2]) {
+            self.pack_pbs
+                .iter_mut()
+                .enumerate()
+                .for_each(|(index, pushbutton)| pushbutton.set_fault(pb_has_fault[index]));
+        }
+
+        fn set_selected_cabin_temperature(
+            &mut self,
+            selected_temperature: [ThermodynamicTemperature; 2],
+        ) {
+            self.selected_cabin_temperature = selected_temperature
+        }
+        fn set_hot_air_pb(&mut self, is_on: bool) {
+            self.hot_air_pb = is_on;
+        }
+        fn set_cabin_fans_pb(&mut self, is_on: bool) {
+            self.cabin_fans_pb = is_on;
+        }
+        fn set_flow_selector(&mut self, selector_position: f64) {
+            self.flow_selector = match selector_position as u8 {
+                0 => OverheadFlowSelector::Lo,
+                1 => OverheadFlowSelector::Norm,
+                2 => OverheadFlowSelector::Hi,
+                _ => panic!("Overhead flow selector position not recognized."),
+            }
+        }
+    }
+    impl AirConditioningOverheadShared for TestAcsOverhead {
+        fn selected_cabin_temperature(&self, zone_id: usize) -> ThermodynamicTemperature {
+            self.selected_cabin_temperature[zone_id]
+        }
+
+        fn pack_pushbuttons_state(&self) -> Vec<bool> {
+            self.pack_pbs.iter().map(|pack| pack.is_on()).collect()
+        }
+
+        fn hot_air_pushbutton_is_on(&self, _hot_air_id: usize) -> bool {
+            self.hot_air_pb
+        }
+
+        fn cabin_fans_is_on(&self) -> bool {
+            self.cabin_fans_pb
+        }
+
+        fn flow_selector_position(&self) -> OverheadFlowSelector {
+            self.flow_selector
+        }
+    }
+    impl SimulationElement for TestAcsOverhead {
+        fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+            accept_iterable!(self.pack_pbs, visitor);
+
+            visitor.visit(self);
+        }
+    }
 
     struct TestAdirs {
         ground_speed: Velocity,
@@ -1272,35 +1666,6 @@ mod acs_controller_tests {
         }
     }
 
-    struct TestPneumaticOverhead {
-        engine_1_bleed: AutoOffFaultPushButton,
-        engine_2_bleed: AutoOffFaultPushButton,
-    }
-
-    impl TestPneumaticOverhead {
-        fn new(context: &mut InitContext) -> Self {
-            Self {
-                engine_1_bleed: AutoOffFaultPushButton::new_auto(context, "PNEU_ENG_1_BLEED"),
-                engine_2_bleed: AutoOffFaultPushButton::new_auto(context, "PNEU_ENG_2_BLEED"),
-            }
-        }
-    }
-
-    impl EngineBleedPushbutton<2> for TestPneumaticOverhead {
-        fn engine_bleed_pushbuttons_are_auto(&self) -> [bool; 2] {
-            [self.engine_1_bleed.is_auto(), self.engine_2_bleed.is_auto()]
-        }
-    }
-
-    impl SimulationElement for TestPneumaticOverhead {
-        fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
-            self.engine_1_bleed.accept(visitor);
-            self.engine_2_bleed.accept(visitor);
-
-            visitor.visit(self);
-        }
-    }
-
     struct TestPressurizationOverheadPanel {
         mode_sel: AutoManFaultPushButton,
         man_vs_ctl_switch: SpringLoadedSwitch,
@@ -1393,23 +1758,25 @@ mod acs_controller_tests {
     }
 
     struct TestPneumatic {
+        apu_bleed: TestApuBleed,
         apu_bleed_air_valve: DefaultValve,
         engine_bleed: [TestEngineBleed; 2],
         cross_bleed_valve: DefaultValve,
         fadec: TestFadec,
-        pub packs: [TestPneumaticPackComplex; 2],
+        packs: [TestPneumaticPackComplex; 2],
     }
 
     impl TestPneumatic {
         fn new(context: &mut InitContext) -> Self {
             Self {
+                apu_bleed: TestApuBleed::new(),
                 apu_bleed_air_valve: DefaultValve::new_closed(),
                 engine_bleed: [TestEngineBleed::new(), TestEngineBleed::new()],
                 cross_bleed_valve: DefaultValve::new_closed(),
                 fadec: TestFadec::new(context),
                 packs: [
-                    TestPneumaticPackComplex::new(1),
-                    TestPneumaticPackComplex::new(2),
+                    TestPneumaticPackComplex::new(1, ElectricalBusType::DirectCurrent(1)),
+                    TestPneumaticPackComplex::new(2, ElectricalBusType::DirectCurrent(2)),
                 ],
             }
         }
@@ -1417,17 +1784,22 @@ mod acs_controller_tests {
         fn update(
             &mut self,
             context: &UpdateContext,
-            pack_flow_valve_signals: &impl PackFlowControllers<2, 2>,
+            pack_flow_valve_signals: [&impl PackFlowControllers; 2],
             engine_bleed: [&impl EngineCorrectedN1; 2],
         ) {
-            self.engine_bleed
-                .iter_mut()
-                .for_each(|b| b.update(context, engine_bleed));
+            let apu_bleed_is_on = self.apu_bleed_is_on();
+
+            self.engine_bleed.iter_mut().for_each(|b| {
+                b.update(context, engine_bleed, apu_bleed_is_on);
+                self.apu_bleed_air_valve
+                    .update_move_fluid(context, &mut self.apu_bleed, b);
+            });
             self.packs
                 .iter_mut()
                 .zip(self.engine_bleed.iter_mut())
-                .for_each(|(pack, engine_bleed)| {
-                    pack.update(context, engine_bleed, pack_flow_valve_signals)
+                .enumerate()
+                .for_each(|(id, (pack, engine_bleed))| {
+                    pack.update(context, engine_bleed, pack_flow_valve_signals[id])
                 });
         }
 
@@ -1456,11 +1828,8 @@ mod acs_controller_tests {
         }
     }
     impl EngineStartState for TestPneumatic {
-        fn left_engine_state(&self) -> EngineState {
-            self.fadec.engine_state(1)
-        }
-        fn right_engine_state(&self) -> EngineState {
-            self.fadec.engine_state(2)
+        fn engine_state(&self, engine_number: usize) -> EngineState {
+            self.fadec.engine_state(engine_number)
         }
         fn engine_mode_selector(&self) -> EngineModeSelector {
             self.fadec.engine_mode_selector()
@@ -1468,15 +1837,20 @@ mod acs_controller_tests {
     }
     impl PackFlowValveState for TestPneumatic {
         fn pack_flow_valve_is_open(&self, pack_id: usize) -> bool {
-            self.packs[pack_id].pfv_open_amount() > Ratio::default()
+            self.packs[pack_id - 1].pfv_open_amount() > Ratio::default()
         }
         fn pack_flow_valve_air_flow(&self, pack_id: usize) -> MassRate {
-            self.packs[pack_id].pack_flow_valve_air_flow()
+            self.packs[pack_id - 1].pack_flow_valve_air_flow()
+        }
+        fn pack_flow_valve_inlet_pressure(&self, pack_id: usize) -> Option<Pressure> {
+            self.packs[pack_id - 1].pack_flow_valve_inlet_pressure()
         }
     }
     impl SimulationElement for TestPneumatic {
         fn accept<V: SimulationElementVisitor>(&mut self, visitor: &mut V) {
             self.fadec.accept(visitor);
+
+            accept_iterable!(self.packs, visitor);
 
             visitor.visit(self);
         }
@@ -1498,15 +1872,21 @@ mod acs_controller_tests {
             }
         }
 
-        fn update(&mut self, context: &UpdateContext, engine_bleed: [&impl EngineCorrectedN1; 2]) {
-            let mut precooler_inlet_pipe = if engine_bleed
-                .iter()
-                .any(|e| e.corrected_n1() > Ratio::new::<percent>(10.))
+        fn update(
+            &mut self,
+            context: &UpdateContext,
+            engine_bleed: [&impl EngineCorrectedN1; 2],
+            apu_bleed_is_on: bool,
+        ) {
+            let mut precooler_inlet_pipe = if !apu_bleed_is_on
+                && engine_bleed
+                    .iter()
+                    .any(|e| e.corrected_n1() > Ratio::new::<percent>(10.))
             {
                 PneumaticPipe::new(
                     Volume::new::<cubic_meter>(8.),
                     Pressure::new::<psi>(44.),
-                    ThermodynamicTemperature::new::<degree_celsius>(144.),
+                    ThermodynamicTemperature::new::<degree_celsius>(200.),
                 )
             } else {
                 PneumaticPipe::new(
@@ -1515,14 +1895,15 @@ mod acs_controller_tests {
                     ThermodynamicTemperature::new::<degree_celsius>(15.),
                 )
             };
-            let mut precooler_supply_pipe = if engine_bleed
-                .iter()
-                .any(|e| e.corrected_n1() > Ratio::new::<percent>(10.))
+            let mut precooler_supply_pipe = if !apu_bleed_is_on
+                && engine_bleed
+                    .iter()
+                    .any(|e| e.corrected_n1() > Ratio::new::<percent>(10.))
             {
                 PneumaticPipe::new(
                     Volume::new::<cubic_meter>(16.),
                     Pressure::new::<psi>(14.7),
-                    ThermodynamicTemperature::new::<degree_celsius>(131.),
+                    ThermodynamicTemperature::new::<degree_celsius>(200.),
                 )
             } else {
                 PneumaticPipe::new(
@@ -1574,14 +1955,52 @@ mod acs_controller_tests {
         }
     }
 
+    struct TestApuBleed {}
+    impl TestApuBleed {
+        fn new() -> Self {
+            Self {}
+        }
+    }
+    impl PneumaticContainer for TestApuBleed {
+        fn pressure(&self) -> Pressure {
+            Pressure::new::<psi>(50.)
+        }
+
+        fn volume(&self) -> Volume {
+            // This is not accurate at all, but has to be able to supply more than the engines to satisfy the flow demand
+            Volume::new::<cubic_meter>(20.)
+        }
+
+        fn temperature(&self) -> ThermodynamicTemperature {
+            ThermodynamicTemperature::new::<degree_celsius>(165.)
+        }
+
+        fn mass(&self) -> Mass {
+            Mass::new::<kilogram>(
+                self.pressure().get::<pascal>() * self.volume().get::<cubic_meter>()
+                    / (Self::GAS_CONSTANT_DRY_AIR * self.temperature().get::<kelvin>()),
+            )
+        }
+
+        fn change_fluid_amount(
+            &mut self,
+            _fluid_amount: Mass,
+            _fluid_temperature: ThermodynamicTemperature,
+            _fluid_pressure: Pressure,
+        ) {
+        }
+        fn update_temperature(&mut self, _temperature: TemperatureInterval) {}
+    }
+
     struct TestPneumaticPackComplex {
         engine_number: usize,
         pack_container: PneumaticPipe,
         exhaust: PneumaticExhaust,
         pack_flow_valve: DefaultValve,
+        pack_inlet_pressure_sensor: PressureTransducer,
     }
     impl TestPneumaticPackComplex {
-        fn new(engine_number: usize) -> Self {
+        fn new(engine_number: usize, powered_by: ElectricalBusType) -> Self {
             Self {
                 engine_number,
                 pack_container: PneumaticPipe::new(
@@ -1591,17 +2010,19 @@ mod acs_controller_tests {
                 ),
                 exhaust: PneumaticExhaust::new(0.3, 0.3, Pressure::new::<psi>(0.)),
                 pack_flow_valve: DefaultValve::new_closed(),
+                pack_inlet_pressure_sensor: PressureTransducer::new(powered_by),
             }
         }
         fn update(
             &mut self,
             context: &UpdateContext,
             from: &mut impl PneumaticContainer,
-            pack_flow_valve_signals: &impl PackFlowControllers<2, 2>,
+            pack_flow_valve_signals: &impl PackFlowControllers,
         ) {
             self.pack_flow_valve.update_open_amount(
-                &pack_flow_valve_signals.pack_flow_controller(self.engine_number.into()),
+                pack_flow_valve_signals.pack_flow_controller(self.engine_number),
             );
+            self.pack_inlet_pressure_sensor.update(context, from);
             self.pack_flow_valve
                 .update_move_fluid(context, from, &mut self.pack_container);
             self.exhaust
@@ -1612,6 +2033,9 @@ mod acs_controller_tests {
         }
         fn pack_flow_valve_air_flow(&self) -> MassRate {
             self.pack_flow_valve.fluid_flow()
+        }
+        fn pack_flow_valve_inlet_pressure(&self) -> Option<Pressure> {
+            self.pack_inlet_pressure_sensor.signal()
         }
     }
     impl PneumaticContainer for TestPneumaticPackComplex {
@@ -1645,16 +2069,24 @@ mod acs_controller_tests {
             self.pack_container.update_temperature(temperature);
         }
     }
+    impl SimulationElement for TestPneumaticPackComplex {
+        fn accept<V: SimulationElementVisitor>(&mut self, visitor: &mut V) {
+            self.pack_inlet_pressure_sensor.accept(visitor);
+            self.pack_flow_valve.accept(visitor);
+
+            visitor.visit(self);
+        }
+    }
 
     struct TestAirConditioningSystem {
-        duct_temperature: Vec<ThermodynamicTemperature>,
+        duct_temperature: [ThermodynamicTemperature; 2],
         outlet_air: Air,
     }
 
     impl TestAirConditioningSystem {
         fn new() -> Self {
             Self {
-                duct_temperature: vec![ThermodynamicTemperature::new::<degree_celsius>(24.); 2],
+                duct_temperature: [ThermodynamicTemperature::new::<degree_celsius>(24.); 2],
                 outlet_air: Air::new(),
             }
         }
@@ -1665,21 +2097,23 @@ mod acs_controller_tests {
             pack_flow: MassRate,
             trim_air_pressure: Pressure,
         ) {
-            self.duct_temperature = duct_temperature;
+            self.duct_temperature = duct_temperature
+                .try_into()
+                .expect("slice with incorrect length");
             self.outlet_air.set_flow_rate(pack_flow);
             self.outlet_air.set_pressure(trim_air_pressure);
             self.outlet_air
                 .set_temperature(self.duct_temperature.iter().average());
         }
 
-        fn duct_temperature(&self) -> Vec<ThermodynamicTemperature> {
-            self.duct_temperature.to_vec()
+        fn duct_temperature(&self) -> &[ThermodynamicTemperature] {
+            &self.duct_temperature
         }
     }
 
     impl DuctTemperature for TestAirConditioningSystem {
         fn duct_temperature(&self) -> Vec<ThermodynamicTemperature> {
-            self.duct_temperature()
+            self.duct_temperature().to_vec()
         }
     }
 
@@ -1688,6 +2122,8 @@ mod acs_controller_tests {
             self.outlet_air
         }
     }
+
+    impl VcmShared for TestAirConditioningSystem {}
 
     struct TestCabinAirSimulation {
         cabin_air_simulation: CabinAirSimulation<TestConstants, 2>,
@@ -1708,7 +2144,7 @@ mod acs_controller_tests {
         fn update(
             &mut self,
             context: &UpdateContext,
-            air_conditioning_system: &(impl OutletAir + DuctTemperature),
+            air_conditioning_system: &(impl OutletAir + DuctTemperature + VcmShared),
             outflow_valve_open_amount: Ratio,
             safety_valve_open_amount: Ratio,
             lgciu_gear_compressed: bool,
@@ -1760,13 +2196,16 @@ mod acs_controller_tests {
     struct TestConstants;
 
     impl PressurizationConstants for TestConstants {
-        const CABIN_VOLUME_CUBIC_METER: f64 = 139.; // m3
+        const CABIN_ZONE_VOLUME_CUBIC_METER: f64 = 139.; // m3
         const COCKPIT_VOLUME_CUBIC_METER: f64 = 9.; // m3
+        const FWD_CARGO_ZONE_VOLUME_CUBIC_METER: f64 = 89.4; // m3
+        const BULK_CARGO_ZONE_VOLUME_CUBIC_METER: f64 = 14.3; // m3
         const PRESSURIZED_FUSELAGE_VOLUME_CUBIC_METER: f64 = 330.; // m3
         const CABIN_LEAKAGE_AREA: f64 = 0.0003; // m2
         const OUTFLOW_VALVE_SIZE: f64 = 0.05; // m2
         const SAFETY_VALVE_SIZE: f64 = 0.02; //m2
         const DOOR_OPENING_AREA: f64 = 1.5; // m2
+        const HULL_BREACH_AREA: f64 = 0.02; // m2
 
         const MAX_CLIMB_RATE: f64 = 750.; // fpm
         const MAX_CLIMB_RATE_IN_DESCENT: f64 = 500.; // fpm
@@ -1785,8 +2224,8 @@ mod acs_controller_tests {
     }
 
     struct TestAircraft {
-        acsc: AirConditioningSystemController<2, 2>,
-        acs_overhead: AirConditioningSystemOverhead<2>,
+        acsc: [AirConditioningSystemController<2, 2>; 2],
+        acs_overhead: TestAcsOverhead,
         adirs: TestAdirs,
         air_conditioning_system: TestAirConditioningSystem,
         cabin_fans: [CabinFan; 2],
@@ -1797,7 +2236,6 @@ mod acs_controller_tests {
         number_of_passengers: u8,
         packs: [AirConditioningPack; 2],
         pneumatic: TestPneumatic,
-        pneumatic_overhead: TestPneumaticOverhead,
         pressurization: TestPressurization,
         pressurization_overhead: TestPressurizationOverheadPanel,
         lgciu1: TestLgciu,
@@ -1808,40 +2246,77 @@ mod acs_controller_tests {
         powered_ac_source_1: TestElectricitySource,
         powered_dc_source_2: TestElectricitySource,
         powered_ac_source_2: TestElectricitySource,
+        powered_dc_ess_source: TestElectricitySource,
         dc_1_bus: ElectricalBus,
         ac_1_bus: ElectricalBus,
         dc_2_bus: ElectricalBus,
         ac_2_bus: ElectricalBus,
+        dc_ess_bus: ElectricalBus,
     }
     impl TestAircraft {
+        const CAB_FAN_DESIGN_FLOW_RATE_L_S: f64 = 325.; // litres/sec
+
         fn new(context: &mut InitContext) -> Self {
             let cabin_zones = [ZoneType::Cockpit, ZoneType::Cabin(1)];
 
             Self {
-                acsc: AirConditioningSystemController::new(
-                    context,
-                    &cabin_zones,
-                    vec![
-                        ElectricalBusType::DirectCurrent(1),
-                        ElectricalBusType::AlternatingCurrent(1),
-                    ],
-                    vec![
-                        ElectricalBusType::DirectCurrent(2),
-                        ElectricalBusType::AlternatingCurrent(2),
-                    ],
-                ),
-                acs_overhead: AirConditioningSystemOverhead::new(context, &cabin_zones),
+                acsc: [
+                    AirConditioningSystemController::new(
+                        context,
+                        AcscId::Acsc1(Channel::ChannelOne),
+                        &cabin_zones,
+                        [
+                            [
+                                ElectricalBusType::AlternatingCurrent(1), // 103XP
+                                ElectricalBusType::DirectCurrent(1),      // 101PP
+                            ],
+                            [
+                                ElectricalBusType::AlternatingCurrent(2),  // 202XP
+                                ElectricalBusType::DirectCurrentEssential, // 4PP
+                            ],
+                        ],
+                    ),
+                    AirConditioningSystemController::new(
+                        context,
+                        AcscId::Acsc2(Channel::ChannelOne),
+                        &cabin_zones,
+                        [
+                            [
+                                ElectricalBusType::AlternatingCurrent(1), // 101XP
+                                ElectricalBusType::DirectCurrent(1),      // 103PP
+                            ],
+                            [
+                                ElectricalBusType::AlternatingCurrent(2), // 204XP
+                                ElectricalBusType::DirectCurrent(2),      // 206PP
+                            ],
+                        ],
+                    ),
+                ],
+                acs_overhead: TestAcsOverhead::new(context),
                 adirs: TestAdirs::new(),
                 air_conditioning_system: TestAirConditioningSystem::new(),
-                cabin_fans: [CabinFan::new(ElectricalBusType::AlternatingCurrent(1)); 2],
+                cabin_fans: [
+                    CabinFan::new(
+                        1,
+                        VolumeRate::new::<liter_per_second>(Self::CAB_FAN_DESIGN_FLOW_RATE_L_S),
+                        ElectricalBusType::AlternatingCurrent(1),
+                    ),
+                    CabinFan::new(
+                        2,
+                        VolumeRate::new::<liter_per_second>(Self::CAB_FAN_DESIGN_FLOW_RATE_L_S),
+                        ElectricalBusType::AlternatingCurrent(2),
+                    ),
+                ],
                 engine_1: TestEngine::new(Ratio::default()),
                 engine_2: TestEngine::new(Ratio::default()),
                 engine_fire_push_buttons: TestEngineFirePushButtons::new(),
                 mixer_unit: MixerUnit::new(&cabin_zones),
                 number_of_passengers: 0,
-                packs: [AirConditioningPack::new(), AirConditioningPack::new()],
+                packs: [
+                    AirConditioningPack::new(context, Pack(1)),
+                    AirConditioningPack::new(context, Pack(2)),
+                ],
                 pneumatic: TestPneumatic::new(context),
-                pneumatic_overhead: TestPneumaticOverhead::new(context),
                 pressurization: TestPressurization::new(),
                 pressurization_overhead: TestPressurizationOverheadPanel::new(context),
                 lgciu1: TestLgciu::new(false),
@@ -1849,7 +2324,10 @@ mod acs_controller_tests {
                 cabin_air_simulation: TestCabinAirSimulation::new(context),
                 trim_air_system: TrimAirSystem::new(
                     context,
-                    &[ZoneType::Cockpit, ZoneType::Cabin(1)],
+                    &cabin_zones,
+                    &[1],
+                    Volume::new::<cubic_meter>(4.),
+                    Volume::new::<cubic_meter>(0.03),
                 ),
                 powered_dc_source_1: TestElectricitySource::powered(
                     context,
@@ -1867,10 +2345,15 @@ mod acs_controller_tests {
                     context,
                     PotentialOrigin::EngineGenerator(2),
                 ),
+                powered_dc_ess_source: TestElectricitySource::powered(
+                    context,
+                    PotentialOrigin::StaticInverter,
+                ),
                 dc_1_bus: ElectricalBus::new(context, ElectricalBusType::DirectCurrent(1)),
                 ac_1_bus: ElectricalBus::new(context, ElectricalBusType::AlternatingCurrent(1)),
                 dc_2_bus: ElectricalBus::new(context, ElectricalBusType::DirectCurrent(2)),
                 ac_2_bus: ElectricalBus::new(context, ElectricalBusType::AlternatingCurrent(2)),
+                dc_ess_bus: ElectricalBus::new(context, ElectricalBusType::DirectCurrentEssential),
             }
         }
 
@@ -1947,6 +2430,10 @@ mod acs_controller_tests {
         fn power_ac_2_bus(&mut self) {
             self.powered_ac_source_2.power();
         }
+
+        fn unpower_dc_ess_bus(&mut self) {
+            self.powered_dc_ess_source.unpower();
+        }
     }
     impl Aircraft for TestAircraft {
         fn update_before_power_distribution(
@@ -1958,31 +2445,38 @@ mod acs_controller_tests {
             electricity.supplied_by(&self.powered_ac_source_1);
             electricity.supplied_by(&self.powered_dc_source_2);
             electricity.supplied_by(&self.powered_ac_source_2);
+            electricity.supplied_by(&self.powered_dc_ess_source);
             electricity.flow(&self.powered_dc_source_1, &self.dc_1_bus);
             electricity.flow(&self.powered_ac_source_1, &self.ac_1_bus);
             electricity.flow(&self.powered_dc_source_2, &self.dc_2_bus);
             electricity.flow(&self.powered_ac_source_2, &self.ac_2_bus);
+            electricity.flow(&self.powered_dc_ess_source, &self.dc_ess_bus)
         }
 
         fn update_after_power_distribution(&mut self, context: &UpdateContext) {
             let lgciu_gears_compressed = self.lgciu1.compressed() && self.lgciu2.compressed();
 
-            self.acsc.update(
+            for acsc in self.acsc.iter_mut() {
+                acsc.update(
+                    context,
+                    &self.adirs,
+                    &self.acs_overhead,
+                    &self.cabin_air_simulation,
+                    [&self.engine_1, &self.engine_2],
+                    &self.engine_fire_push_buttons,
+                    &self.pneumatic,
+                    &self.pressurization,
+                    &self.pressurization_overhead,
+                    [&self.lgciu1, &self.lgciu2],
+                    &self.trim_air_system,
+                );
+            }
+
+            self.pneumatic.update(
                 context,
-                &self.adirs,
-                &self.acs_overhead,
-                &self.cabin_air_simulation,
+                [&self.acsc[0], &self.acsc[1]],
                 [&self.engine_1, &self.engine_2],
-                &self.engine_fire_push_buttons,
-                &self.pneumatic,
-                &self.pneumatic_overhead,
-                &self.pressurization,
-                &self.pressurization_overhead,
-                [&self.lgciu1, &self.lgciu2],
-                &self.trim_air_system,
             );
-            self.pneumatic
-                .update(context, &self.acsc, [&self.engine_1, &self.engine_2]);
             self.trim_air_system
                 .mix_packs_air_update(self.pneumatic.packs());
 
@@ -1995,18 +2489,27 @@ mod acs_controller_tests {
                 [0, self.number_of_passengers / 2],
             );
 
-            let pack_flow: [MassRate; 2] = [
-                self.acsc.individual_pack_flow(Pack(1)),
-                self.acsc.individual_pack_flow(Pack(2)),
+            let pack_flow = [0, 1].map(|id| self.acsc[id].individual_pack_flow());
+
+            let duct_demand_temperature = vec![
+                self.acsc[0].duct_demand_temperature()[0],
+                self.acsc[1].duct_demand_temperature()[1],
             ];
-            let duct_demand_temperature = self.acsc.duct_demand_temperature();
-            for (id, pack) in self.packs.iter_mut().enumerate() {
-                pack.update(pack_flow[id], &duct_demand_temperature)
-            }
+
+            [0, 1].iter().for_each(|&id| {
+                self.packs[id].update(
+                    context,
+                    pack_flow[id],
+                    &duct_demand_temperature,
+                    self.acsc[id].both_channels_failure(),
+                )
+            });
+
+            // Fan monitors by ACSC 2
             for fan in self.cabin_fans.iter_mut() {
                 fan.update(
                     &self.cabin_air_simulation,
-                    &self.acsc.cabin_fans_controller(),
+                    &self.acsc[1].cabin_fans_controller(),
                 );
             }
             let mut mixer_intakes: Vec<&dyn OutletAir> = vec![&self.packs[0], &self.packs[1]];
@@ -2015,26 +2518,37 @@ mod acs_controller_tests {
             }
             self.mixer_unit.update(mixer_intakes);
 
-            self.trim_air_system
-                .update(context, &self.mixer_unit, &self.acsc);
+            self.trim_air_system.update(
+                context,
+                &self.mixer_unit,
+                [
+                    self.acsc[0].trim_air_pressure_regulating_valve_controller(),
+                    self.acsc[1].trim_air_pressure_regulating_valve_controller(),
+                ],
+                &[&self.acsc[0], &self.acsc[1]],
+            );
 
-            self.acs_overhead
-                .set_pack_pushbutton_fault(self.acsc.pack_fault_determination(&self.pneumatic));
+            self.acs_overhead.set_pack_pushbutton_fault([
+                self.acsc[0].pack_fault_determination(),
+                self.acsc[1].pack_fault_determination(),
+            ]);
 
             self.air_conditioning_system.update(
                 self.trim_air_system.duct_temperature(),
-                self.acsc.individual_pack_flow(Pack(1)) + self.acsc.individual_pack_flow(Pack(2)),
+                self.acsc[0].individual_pack_flow() + self.acsc[1].individual_pack_flow(),
                 self.trim_air_system.trim_air_outlet_pressure(),
             );
         }
     }
+
     impl SimulationElement for TestAircraft {
         fn accept<V: SimulationElementVisitor>(&mut self, visitor: &mut V) {
-            self.acsc.accept(visitor);
+            accept_iterable!(self.acsc, visitor);
             self.acs_overhead.accept(visitor);
             self.cabin_air_simulation.accept(visitor);
             self.pneumatic.accept(visitor);
             self.pressurization_overhead.accept(visitor);
+            self.trim_air_system.accept(visitor);
             accept_iterable!(self.cabin_fans, visitor);
 
             visitor.visit(self);
@@ -2053,7 +2567,7 @@ mod acs_controller_tests {
             test_bed.set_indicated_altitude(Length::new::<foot>(0.));
             test_bed.set_ambient_temperature(ThermodynamicTemperature::new::<degree_celsius>(24.));
             test_bed.command_pax_quantity(0);
-            test_bed.command_pack_flow_selector_position(1);
+            test_bed.command_pack_flow_selector_position(1.);
 
             test_bed
         }
@@ -2120,6 +2634,11 @@ mod acs_controller_tests {
             self
         }
 
+        fn both_engines_off(mut self) -> Self {
+            self.command(|a| a.set_engine_n1(Ratio::new::<percent>(0.)));
+            self
+        }
+
         fn landing_gear_compressed(mut self) -> Self {
             self.command(|a| a.set_on_ground(true));
             self
@@ -2144,49 +2663,49 @@ mod acs_controller_tests {
 
         fn ac_state_is_initialisation(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::Initialisation(_)
             )
         }
 
         fn ac_state_is_on_ground(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::OnGround(_)
             )
         }
 
         fn ac_state_is_begin_takeoff(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::BeginTakeOff(_)
             )
         }
 
         fn ac_state_is_end_takeoff(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::EndTakeOff(_)
             )
         }
 
         fn ac_state_is_in_flight(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::InFlight(_)
             )
         }
 
         fn ac_state_is_begin_landing(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::BeginLanding(_)
             )
         }
 
         fn ac_state_is_end_landing(&self) -> bool {
             matches!(
-                self.query(|a| a.acsc.aircraft_state),
+                self.query(|a| a.acsc[0].aircraft_state),
                 AirConditioningStateManager::EndLanding(_)
             )
         }
@@ -2231,13 +2750,18 @@ mod acs_controller_tests {
             self
         }
 
+        fn unpowered_dc_ess_bus(mut self) -> Self {
+            self.command(|a| a.unpower_dc_ess_bus());
+            self
+        }
+
         fn hot_air_pb_on(mut self, value: bool) -> Self {
-            self.write_by_name("OVHD_COND_HOT_AIR_PB_IS_ON", value);
+            self.command(|a| a.acs_overhead.set_hot_air_pb(value));
             self
         }
 
         fn cab_fans_pb_on(mut self, value: bool) -> Self {
-            self.write_by_name("OVHD_VENT_CAB_FANS_PB_IS_ON", value);
+            self.command(|a| a.acs_overhead.set_cabin_fans_pb(value));
             self
         }
 
@@ -2245,13 +2769,7 @@ mod acs_controller_tests {
             mut self,
             temp_array: [ThermodynamicTemperature; 2],
         ) -> Self {
-            for (temp, id) in temp_array.iter().zip(["CKPT", "FWD"].iter()) {
-                let zone_selected_temp_id = format!("OVHD_COND_{}_SELECTOR_KNOB", &id);
-                self.write_by_name(
-                    &zone_selected_temp_id,
-                    (temp.get::<degree_celsius>() - 18.) / 0.04,
-                );
-            }
+            self.command(|a| a.acs_overhead.set_selected_cabin_temperature(temp_array));
             self
         }
 
@@ -2271,8 +2789,6 @@ mod acs_controller_tests {
         }
 
         fn command_pax_quantity(&mut self, pax_quantity: u8) {
-            self.write_by_name(&format!("PAX_TOTAL_ROWS_{}_{}", 1, 6), pax_quantity / 2);
-            self.write_by_name(&format!("PAX_TOTAL_ROWS_{}_{}", 7, 13), pax_quantity / 2);
             self.command(|a| a.set_passengers(pax_quantity));
         }
 
@@ -2280,8 +2796,8 @@ mod acs_controller_tests {
             self.command(|a| a.pressurization.set_cabin_altitude(altitude));
         }
 
-        fn command_pack_flow_selector_position(&mut self, value: u8) {
-            self.write_by_name("KNOB_OVHD_AIRCOND_PACKFLOW_Position", value);
+        fn command_pack_flow_selector_position(&mut self, value: f64) {
+            self.command(|a| a.acs_overhead.set_flow_selector(value));
         }
 
         fn command_pack_1_pb_position(&mut self, value: bool) {
@@ -2331,16 +2847,20 @@ mod acs_controller_tests {
         }
 
         fn duct_demand_temperature(&self) -> Vec<ThermodynamicTemperature> {
-            self.query(|a| a.acsc.duct_demand_temperature())
+            vec![
+                self.query(|a| a.acsc[0].duct_demand_temperature()[0]),
+                self.query(|a| a.acsc[1].duct_demand_temperature())[1],
+            ]
         }
 
         fn duct_temperature(&self) -> Vec<ThermodynamicTemperature> {
             self.query(|a| a.trim_air_system.duct_temperature())
+                .to_vec()
         }
 
         fn pack_flow(&self) -> MassRate {
             self.query(|a| {
-                a.pneumatic.pack_flow_valve_air_flow(0) + a.pneumatic.pack_flow_valve_air_flow(1)
+                a.pneumatic.pack_flow_valve_air_flow(1) + a.pneumatic.pack_flow_valve_air_flow(2)
             })
         }
 
@@ -2354,8 +2874,8 @@ mod acs_controller_tests {
 
         fn trim_air_system_controller_is_enabled(&self) -> bool {
             self.query(|a| {
-                a.acsc.trim_air_system_controller.is_enabled()
-                    && a.acsc.trim_air_system_controller.is_open()
+                a.acsc[0].trim_air_pressure_regulating_valve_is_open()
+                    && a.acsc[1].trim_air_pressure_regulating_valve_is_open()
             })
         }
 
@@ -2367,16 +2887,24 @@ mod acs_controller_tests {
             self.query(|a| a.trim_air_system.duct_temperature()[0])
         }
 
+        fn trim_air_system_outlet_pressure(&self) -> Pressure {
+            self.query(|a| a.trim_air_system.outlet_air.pressure())
+        }
+
         fn trim_air_valves_open_amount(&self) -> [Ratio; 2] {
             self.query(|a| a.trim_air_system.trim_air_valves_open_amount())
         }
 
         fn mixer_unit_controller_is_enabled(&self) -> bool {
-            self.query(|a| a.acsc.cabin_fans_controller.is_enabled())
+            self.query(|a| a.acsc[0].cabin_fans_controller.is_enabled())
         }
 
         fn mixer_unit_outlet_air(&self) -> Air {
             self.query(|a| a.mixer_unit.outlet_air())
+        }
+
+        fn trim_air_high_pressure(&self) -> bool {
+            self.query(|a| a.trim_air_system.trim_air_high_pressure())
         }
     }
 
@@ -2639,6 +3167,166 @@ mod acs_controller_tests {
         }
     }
 
+    mod air_conditioning_system_controller_tests {
+        use super::*;
+
+        #[test]
+        fn trim_air_achieves_selected_temperature() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ])
+                .iterate(1000);
+
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 26.).abs() < 1.);
+        }
+
+        #[test]
+        fn duct_temperature_does_not_jump_on_instant_engine_off() {
+            let test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .iterate(1000)
+                .both_engines_off()
+                .both_packs_off()
+                .cab_fans_pb_on(false)
+                .iterate(2);
+
+            assert!(test_bed.duct_temperature()[1].get::<degree_celsius>() < 80.);
+        }
+
+        #[test]
+        fn unpowering_one_lane_has_no_effect() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ])
+                .unpowered_ac_1_bus()
+                .iterate(1000);
+
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 26.).abs() < 1.);
+        }
+
+        #[test]
+        fn failing_one_lane_has_no_effect() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ]);
+
+            test_bed.fail(FailureType::Acsc(AcscId::Acsc1(Channel::ChannelOne)));
+            test_bed = test_bed.iterate(1000);
+
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 26.).abs() < 1.);
+        }
+
+        #[test]
+        fn unpowering_both_lanes_shuts_off_pack() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ])
+                .unpowered_ac_1_bus()
+                .unpowered_dc_2_bus()
+                .iterate(1000);
+
+            assert_eq!(test_bed.trim_air_valves_open_amount()[1], Ratio::default());
+            assert!(!test_bed.trim_air_system_controller_is_enabled());
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 26.).abs() > 1.);
+        }
+
+        #[test]
+        fn failing_both_lanes_shuts_off_pack() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ]);
+
+            test_bed.fail(FailureType::Acsc(AcscId::Acsc2(Channel::ChannelOne)));
+            test_bed.fail(FailureType::Acsc(AcscId::Acsc2(Channel::ChannelTwo)));
+            test_bed = test_bed.iterate(1000);
+
+            assert_eq!(test_bed.trim_air_valves_open_amount()[1], Ratio::default());
+            assert!(!test_bed.trim_air_system_controller_is_enabled());
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 26.).abs() > 1.);
+        }
+
+        #[test]
+        fn unpowering_opposite_acsc_doesnt_shut_off_pack() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ])
+                .unpowered_ac_1_bus()
+                .unpowered_dc_1_bus()
+                .unpowered_dc_ess_bus()
+                .iterate(1000);
+
+            assert_ne!(test_bed.pack_flow(), MassRate::default());
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 24.).abs() < 1.);
+        }
+
+        #[test]
+        fn failing_opposite_acsc_doesnt_shut_off_pack() {
+            let mut test_bed = test_bed()
+                .with()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .and()
+                .command_selected_temperature([
+                    ThermodynamicTemperature::new::<degree_celsius>(24.),
+                    ThermodynamicTemperature::new::<degree_celsius>(26.),
+                ]);
+
+            test_bed.fail(FailureType::Acsc(AcscId::Acsc1(Channel::ChannelOne)));
+            test_bed.fail(FailureType::Acsc(AcscId::Acsc1(Channel::ChannelTwo)));
+            test_bed = test_bed.iterate(1000);
+
+            assert_ne!(test_bed.pack_flow(), MassRate::default());
+            assert!((test_bed.measured_temperature().get::<degree_celsius>() - 24.).abs() < 1.);
+        }
+    }
+
     mod zone_controller_tests {
         use super::*;
 
@@ -2853,7 +3541,7 @@ mod acs_controller_tests {
         }
 
         #[test]
-        fn knobs_dont_affect_duct_temperature_when_primary_unpowered() {
+        fn knobs_dont_affect_duct_temperature_one_acsc_unpowered() {
             let mut test_bed = test_bed()
                 .with()
                 .both_packs_on()
@@ -2862,6 +3550,7 @@ mod acs_controller_tests {
                 .and()
                 .unpowered_dc_1_bus()
                 .unpowered_ac_1_bus()
+                .unpowered_dc_ess_bus()
                 .command_selected_temperature(
                     [ThermodynamicTemperature::new::<degree_celsius>(30.); 2],
                 );
@@ -2872,7 +3561,7 @@ mod acs_controller_tests {
         }
 
         #[test]
-        fn unpowering_the_system_gives_control_to_packs() {
+        fn failing_galley_fans_sets_duct_demand_to_15c() {
             let mut test_bed = test_bed()
                 .with()
                 .both_packs_on()
@@ -2880,33 +3569,33 @@ mod acs_controller_tests {
                 .engine_idle()
                 .iterate(2)
                 .and()
-                .unpowered_dc_1_bus()
-                .unpowered_ac_1_bus()
-                .unpowered_dc_2_bus()
-                .unpowered_ac_2_bus()
                 .command_selected_temperature(
                     [ThermodynamicTemperature::new::<degree_celsius>(30.); 2],
-                );
+                )
+                .iterate(500);
 
-            test_bed = test_bed.iterate_with_delta(100, Duration::from_secs(10));
+            test_bed.fail(FailureType::GalleyFans);
+
+            test_bed = test_bed.iterate(100);
 
             assert!(
-                (test_bed.duct_demand_temperature()[0].get::<degree_celsius>() - 20.).abs() < 1.
+                (test_bed.duct_demand_temperature()[1].get::<degree_celsius>() - 15.).abs() < 1.
             );
-            assert!(
-                (test_bed.duct_demand_temperature()[1].get::<degree_celsius>() - 10.).abs() < 1.
+            assert_eq!(
+                (test_bed.trim_air_valves_open_amount()[1]),
+                Ratio::default()
             );
         }
 
         #[test]
-        fn unpowering_and_repowering_primary_behaves_as_expected() {
+        fn unpowering_and_repowering_acsc_behaves_as_expected() {
             let mut test_bed = test_bed()
                 .with()
                 .both_packs_on()
                 .and()
                 .engine_idle()
                 .and()
-                .unpowered_dc_1_bus()
+                .unpowered_dc_2_bus()
                 .unpowered_ac_1_bus()
                 .command_selected_temperature(
                     [ThermodynamicTemperature::new::<degree_celsius>(30.); 2],
@@ -2914,7 +3603,7 @@ mod acs_controller_tests {
             test_bed = test_bed.iterate(1000);
             assert!((test_bed.duct_temperature()[1].get::<degree_celsius>() - 24.).abs() < 1.);
 
-            test_bed = test_bed.powered_dc_1_bus().powered_ac_1_bus();
+            test_bed = test_bed.powered_dc_2_bus().powered_ac_1_bus();
             test_bed = test_bed.iterate(1000);
             assert!(test_bed.duct_temperature()[1].get::<degree_celsius>() > 24.);
         }
@@ -2953,7 +3642,7 @@ mod acs_controller_tests {
 
             let initial_flow = test_bed.pack_flow();
 
-            test_bed.command_pack_flow_selector_position(2);
+            test_bed.command_pack_flow_selector_position(2.);
             test_bed = test_bed.iterate(2);
 
             assert!(test_bed.pack_flow() > initial_flow);
@@ -2970,7 +3659,7 @@ mod acs_controller_tests {
 
             let initial_flow = test_bed.pack_flow();
 
-            test_bed.command_pack_flow_selector_position(0);
+            test_bed.command_pack_flow_selector_position(0.);
             test_bed = test_bed.iterate(2);
 
             assert!(test_bed.pack_flow() < initial_flow);
@@ -3012,7 +3701,7 @@ mod acs_controller_tests {
         fn pack_flow_increases_when_pack_in_start_condition() {
             let mut test_bed = test_bed().with().both_packs_on().and().engine_idle();
 
-            test_bed.command_pack_flow_selector_position(0);
+            test_bed.command_pack_flow_selector_position(0.);
             test_bed = test_bed.iterate(29);
 
             let initial_flow = test_bed.pack_flow();
@@ -3145,7 +3834,7 @@ mod acs_controller_tests {
 
         #[test]
         fn pack_flow_valve_has_fault_when_no_bleed() {
-            let mut test_bed = test_bed().with().both_packs_on().iterate(2);
+            let mut test_bed = test_bed().with().both_packs_on().iterate(6);
 
             assert!(test_bed.pack_1_has_fault());
             assert!(test_bed.pack_2_has_fault());
@@ -3188,7 +3877,7 @@ mod acs_controller_tests {
 
         #[test]
         fn pack_flow_light_resets_after_condition() {
-            let mut test_bed = test_bed().with().both_packs_on().iterate(2);
+            let mut test_bed = test_bed().with().both_packs_on().iterate(6);
 
             assert!(test_bed.pack_1_has_fault());
             assert!(test_bed.pack_2_has_fault());
@@ -3200,13 +3889,16 @@ mod acs_controller_tests {
             assert!(!test_bed.pack_2_has_fault());
 
             test_bed.command_apu_bleed_off();
-            test_bed = test_bed.iterate(2);
+            // Wait 10s because it takes some time for the pack inlet pressure to drop and 5s
+            // for the "insufficient pressure" condition to confirm
+            test_bed = test_bed.iterate(10);
+
             assert!(test_bed.pack_1_has_fault());
             assert!(test_bed.pack_2_has_fault());
         }
 
         #[test]
-        fn pack_flow_controller_is_unresponsive_when_unpowered() {
+        fn pack_flow_is_zero_when_acsc_unpowered() {
             let mut test_bed = test_bed()
                 .with()
                 .both_packs_on()
@@ -3220,14 +3912,14 @@ mod acs_controller_tests {
                 .unpowered_ac_1_bus()
                 .unpowered_dc_2_bus()
                 .unpowered_ac_2_bus();
-            test_bed.command_ditching_on();
+
             test_bed = test_bed.iterate(2);
 
-            assert!(test_bed.pack_flow() > MassRate::default());
+            assert_eq!(test_bed.pack_flow(), MassRate::default());
         }
 
         #[test]
-        fn unpowering_ac_or_dc_unpowers_system() {
+        fn unpowering_one_acsc_shuts_down_one_pack_only() {
             let mut test_bed = test_bed()
                 .with()
                 .both_packs_on()
@@ -3236,44 +3928,29 @@ mod acs_controller_tests {
                 .iterate(2);
             assert!(test_bed.pack_flow() > MassRate::default());
 
-            test_bed = test_bed.unpowered_dc_1_bus().unpowered_ac_2_bus();
-            test_bed.command_ditching_on();
+            let initial_flow = test_bed.pack_flow();
+
+            test_bed = test_bed.unpowered_dc_2_bus().unpowered_ac_1_bus();
+
             test_bed = test_bed.iterate(2);
+
+            assert!(test_bed.pack_flow() < initial_flow);
             assert!(test_bed.pack_flow() > MassRate::default());
 
             test_bed = test_bed
-                .powered_dc_1_bus()
-                .unpowered_ac_1_bus()
-                .unpowered_dc_2_bus()
-                .powered_ac_2_bus();
+                .unpowered_dc_1_bus()
+                .unpowered_dc_ess_bus()
+                .powered_dc_2_bus()
+                .powered_ac_1_bus();
             test_bed = test_bed.iterate(2);
+            assert!(test_bed.pack_flow() < initial_flow);
             assert!(test_bed.pack_flow() > MassRate::default());
 
-            test_bed = test_bed.powered_ac_1_bus().powered_dc_2_bus().iterate(2);
-            assert_eq!(test_bed.pack_flow(), MassRate::default(),);
-        }
-
-        #[test]
-        fn pack_flow_loses_optimization_when_secondary_computer_active() {
-            let mut test_bed = test_bed()
-                .with()
-                .both_packs_on()
-                .and()
-                .engine_idle()
-                .iterate(40);
-
-            let initial_flow = test_bed.pack_flow();
-            test_bed.command_apu_bleed_on();
-            test_bed.run();
-            assert!(test_bed.pack_flow() > initial_flow);
-
-            test_bed = test_bed.unpowered_dc_1_bus().unpowered_ac_1_bus();
-            test_bed.command_pack_flow_selector_position(0);
-            test_bed = test_bed.iterate(20);
-            assert!(
-                (test_bed.pack_flow() - initial_flow).abs()
-                    < MassRate::new::<kilogram_per_second>(0.1)
-            );
+            test_bed = test_bed
+                .unpowered_ac_1_bus()
+                .unpowered_dc_2_bus()
+                .iterate(20);
+            assert_eq!(test_bed.pack_flow(), MassRate::default());
         }
 
         #[test]
@@ -3291,9 +3968,9 @@ mod acs_controller_tests {
                 .unpowered_ac_1_bus()
                 .unpowered_dc_2_bus()
                 .unpowered_ac_2_bus();
-            test_bed.command_ditching_on();
+
             test_bed = test_bed.iterate(2);
-            assert!(test_bed.pack_flow() > MassRate::default());
+            assert_eq!(test_bed.pack_flow(), MassRate::default());
 
             test_bed = test_bed
                 .powered_dc_1_bus()
@@ -3301,7 +3978,7 @@ mod acs_controller_tests {
                 .powered_dc_2_bus()
                 .powered_ac_2_bus()
                 .iterate(2);
-            assert_eq!(test_bed.pack_flow(), MassRate::default());
+            assert!(test_bed.pack_flow() > MassRate::default());
         }
     }
 
@@ -3339,21 +4016,24 @@ mod acs_controller_tests {
                 .iterate(32);
             assert!(test_bed.trim_air_system_controller_is_enabled());
 
-            test_bed = test_bed.hot_air_pb_on(false).and_run();
+            test_bed = test_bed.hot_air_pb_on(false).iterate(4);
             assert!(!test_bed.trim_air_system_controller_is_enabled());
 
             test_bed = test_bed.hot_air_pb_on(true);
             test_bed.command_pack_1_pb_position(false);
-            test_bed = test_bed.iterate(2);
+            test_bed = test_bed.iterate(4);
             assert!(test_bed.trim_air_system_controller_is_enabled());
 
             // Pack 1 should be in start condition
             test_bed.command_pack_1_pb_position(true);
-            test_bed = test_bed.iterate(2);
+            test_bed = test_bed.iterate(6);
             assert!(!test_bed.trim_air_system_controller_is_enabled());
 
-            // Secondary circuit
-            test_bed = test_bed.unpowered_dc_1_bus().unpowered_ac_1_bus().and_run();
+            // ACSC 1 unpowered
+            test_bed = test_bed
+                .unpowered_dc_1_bus()
+                .unpowered_ac_1_bus()
+                .iterate(4);
             assert!(!test_bed.trim_air_system_controller_is_enabled());
 
             test_bed = test_bed.powered_dc_1_bus().powered_ac_1_bus().iterate(32);
@@ -3362,6 +4042,8 @@ mod acs_controller_tests {
     }
 
     mod mixer_unit_tests {
+        use crate::failures::FailureType;
+
         use super::*;
 
         #[test]
@@ -3386,12 +4068,15 @@ mod acs_controller_tests {
             test_bed = test_bed.cab_fans_pb_on(false).and_run();
             assert!(!test_bed.mixer_unit_controller_is_enabled());
 
-            // Unpower both circuits
+            // Unpowering ACSC doesn't affect fans
             test_bed = test_bed.cab_fans_pb_on(true);
-            test_bed = test_bed.unpowered_dc_1_bus().unpowered_ac_2_bus().and_run();
-            assert!(!test_bed.mixer_unit_controller_is_enabled());
+            test_bed = test_bed
+                .unpowered_dc_1_bus()
+                .unpowered_ac_1_bus()
+                .unpowered_dc_2_bus()
+                .unpowered_ac_2_bus()
+                .and_run();
 
-            test_bed = test_bed.powered_dc_1_bus().powered_ac_2_bus().and_run();
             assert!(test_bed.mixer_unit_controller_is_enabled());
         }
 
@@ -3439,7 +4124,7 @@ mod acs_controller_tests {
                 .iterate(50);
 
             let initial_flow = test_bed.mixer_unit_outlet_air().flow_rate();
-            test_bed.command_pack_flow_selector_position(2);
+            test_bed.command_pack_flow_selector_position(2.);
             test_bed = test_bed.iterate(50);
 
             assert!(test_bed.mixer_unit_outlet_air().flow_rate() > initial_flow);
@@ -3504,6 +4189,7 @@ mod acs_controller_tests {
             assert!(
                 (test_bed.mixer_unit_outlet_air().flow_rate()
                     - MassRate::new::<kilogram_per_second>(1.683))
+                .abs()
                     < MassRate::new::<kilogram_per_second>(0.1)
             )
         }
@@ -3545,12 +4231,41 @@ mod acs_controller_tests {
                     > MassRate::new::<kilogram_per_second>(0.1)
             );
 
-            test_bed = test_bed.unpowered_ac_1_bus().iterate(50);
+            test_bed = test_bed
+                .unpowered_ac_1_bus()
+                .unpowered_ac_2_bus()
+                .iterate(50);
 
             assert!(
                 (test_bed.mixer_unit_outlet_air().flow_rate() - test_bed.pack_flow())
                     < MassRate::new::<kilogram_per_second>(0.1)
             )
+        }
+
+        #[test]
+        fn cabin_fans_dont_work_with_fault() {
+            let mut test_bed = test_bed()
+                .with()
+                .cab_fans_pb_on(true)
+                .and()
+                .both_packs_on()
+                .and()
+                .engine_idle()
+                .iterate(50);
+
+            assert!(
+                (test_bed.mixer_unit_outlet_air().flow_rate() - test_bed.pack_flow())
+                    > MassRate::new::<kilogram_per_second>(0.1)
+            );
+
+            test_bed.fail(FailureType::CabinFan(1));
+            test_bed.fail(FailureType::CabinFan(2));
+            test_bed = test_bed.iterate(50);
+
+            assert!(
+                (test_bed.mixer_unit_outlet_air().flow_rate() - test_bed.pack_flow())
+                    < MassRate::new::<kilogram_per_second>(0.1)
+            );
         }
     }
 
@@ -3600,6 +4315,28 @@ mod acs_controller_tests {
         }
 
         #[test]
+        fn trim_air_pressure_regulating_valve_is_unresponsive_when_failed() {
+            let mut test_bed = test_bed()
+                .with()
+                .hot_air_pb_on(true)
+                .and()
+                .engine_idle()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ))
+                .iterate(400);
+
+            test_bed.fail(FailureType::HotAir(1));
+            test_bed = test_bed.hot_air_pb_on(false).iterate(100);
+
+            assert!((test_bed.trim_air_system_outlet_air(1).flow_rate()) > MassRate::default());
+            assert!(
+                (test_bed.trim_air_system_outlet_air(1).temperature())
+                    > ThermodynamicTemperature::new::<degree_celsius>(25.)
+            );
+        }
+
+        #[test]
         fn trim_valves_close_if_selected_temp_below_measured() {
             let mut test_bed = test_bed()
                 .with()
@@ -3619,6 +4356,158 @@ mod acs_controller_tests {
                 (test_bed.trim_air_system_outlet_air(1).flow_rate())
                     < MassRate::new::<kilogram_per_second>(0.01)
             );
+        }
+
+        #[test]
+        fn trim_air_valves_are_unresponsive_when_failed() {
+            let mut test_bed = test_bed()
+                .with()
+                .engine_idle()
+                .both_packs_on()
+                .and()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ));
+
+            test_bed.command_measured_temperature(
+                [ThermodynamicTemperature::new::<degree_celsius>(15.); 2],
+            );
+
+            test_bed = test_bed.iterate(100);
+
+            assert!((test_bed.trim_air_valves_open_amount()[1]) > Ratio::default());
+
+            let initial_open = test_bed.trim_air_valves_open_amount()[1];
+
+            test_bed = test_bed.command_fwd_selected_temperature(ThermodynamicTemperature::new::<
+                degree_celsius,
+            >(18.));
+
+            test_bed.fail(FailureType::TrimAirFault(ZoneType::Cabin(1)));
+
+            test_bed.command_measured_temperature(
+                [ThermodynamicTemperature::new::<degree_celsius>(30.); 2],
+            );
+
+            test_bed = test_bed.iterate(100);
+
+            assert!((test_bed.trim_air_valves_open_amount()[1]) > Ratio::default());
+            assert_eq!(test_bed.trim_air_valves_open_amount()[1], initial_open);
+        }
+
+        #[test]
+        fn trim_air_system_delivers_overheat_air_if_overheat() {
+            let mut test_bed = test_bed()
+                .with()
+                .hot_air_pb_on(true)
+                .and()
+                .engine_idle()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ))
+                .iterate(500);
+
+            assert!((test_bed.trim_air_system_outlet_air(1).flow_rate()) > MassRate::default());
+            assert!(
+                (test_bed.trim_air_system_outlet_air(1).temperature())
+                    > ThermodynamicTemperature::new::<degree_celsius>(25.)
+            );
+
+            test_bed.fail(FailureType::TrimAirOverheat(ZoneType::Cabin(1)));
+
+            test_bed = test_bed.iterate(1);
+
+            assert!(
+                (test_bed.duct_temperature()[1])
+                    > ThermodynamicTemperature::new::<degree_celsius>(88.)
+            );
+        }
+
+        #[test]
+        fn hot_air_closes_if_overheat() {
+            let mut test_bed = test_bed()
+                .with()
+                .hot_air_pb_on(true)
+                .and()
+                .engine_idle()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ))
+                .iterate(500);
+
+            test_bed.command_measured_temperature(
+                [ThermodynamicTemperature::new::<degree_celsius>(15.); 2],
+            );
+            assert!((test_bed.trim_air_system_outlet_air(1).flow_rate()) > MassRate::default());
+            test_bed.fail(FailureType::TrimAirOverheat(ZoneType::Cabin(1)));
+
+            test_bed = test_bed.iterate(500);
+
+            assert!(
+                (test_bed.trim_air_system_outlet_air(1).flow_rate())
+                    < MassRate::new::<kilogram_per_second>(0.001)
+            );
+        }
+
+        #[test]
+        fn hot_air_closes_if_one_tav_failed() {
+            let mut test_bed = test_bed()
+                .with()
+                .hot_air_pb_on(true)
+                .and()
+                .engine_idle()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ));
+
+            test_bed.command_measured_temperature([
+                ThermodynamicTemperature::new::<degree_celsius>(25.),
+                ThermodynamicTemperature::new::<degree_celsius>(15.),
+            ]);
+
+            test_bed = test_bed.iterate(500);
+
+            assert!((test_bed.duct_temperature()[1] > test_bed.duct_temperature()[0]));
+            test_bed.fail(FailureType::TrimAirFault(ZoneType::Cabin(1)));
+
+            test_bed = test_bed.iterate(100);
+
+            assert!(
+                (test_bed.duct_temperature()[0].get::<degree_celsius>()
+                    - test_bed.duct_temperature()[1].get::<degree_celsius>())
+                .abs()
+                    < 1.
+            );
+        }
+
+        #[test]
+        fn trim_increases_pressure_if_overpressure() {
+            let mut test_bed = test_bed()
+                .with()
+                .engine_idle()
+                .and()
+                .command_fwd_selected_temperature(ThermodynamicTemperature::new::<degree_celsius>(
+                    30.,
+                ));
+
+            test_bed.command_measured_temperature(
+                [ThermodynamicTemperature::new::<degree_celsius>(15.); 2],
+            );
+
+            test_bed = test_bed.iterate(50);
+
+            assert!(
+                (test_bed.trim_air_system_outlet_air(1).flow_rate())
+                    > MassRate::new::<kilogram_per_second>(0.01)
+            );
+            assert!((test_bed.trim_air_system_outlet_pressure()) < Pressure::new::<psi>(20.));
+
+            test_bed.fail(FailureType::TrimAirHighPressure);
+
+            test_bed = test_bed.iterate(50);
+
+            assert!((test_bed.trim_air_system_outlet_pressure()) > Pressure::new::<psi>(20.));
+            assert!(test_bed.trim_air_high_pressure());
         }
 
         #[test]

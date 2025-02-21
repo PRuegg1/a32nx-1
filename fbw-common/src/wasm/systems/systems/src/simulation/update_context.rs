@@ -2,7 +2,10 @@ use std::time::Duration;
 use uom::si::{
     acceleration::meter_per_second_squared,
     angle::radian,
+    angular_acceleration::radian_per_second_squared,
+    angular_velocity::{degree_per_second, radian_per_second},
     f64::*,
+    length::millimeter,
     mass_density::kilogram_per_cubic_meter,
     pressure::inch_of_mercury,
     time::second,
@@ -46,6 +49,65 @@ impl Attitude {
 
     fn bank(&self) -> Angle {
         self.bank
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SurfaceTypeMsfs {
+    Concrete = 0,
+    Grass = 1,
+    Water = 2,
+    GrassBumpy = 3,
+    Asphalt = 4,
+    ShortGrass = 5,
+    LongGrass = 6,
+    HardTurf = 7,
+    Snow = 8,
+    Ice = 9,
+    Urban = 10,
+    Forest = 11,
+    Dirt = 12,
+    Coral = 13,
+    Gravel = 14,
+    OilTreated = 15,
+    SteelMats = 16,
+    Bituminus = 17,
+    Brick = 18,
+    Macadam = 19,
+    Planks = 20,
+    Sand = 21,
+    Shale = 22,
+    Tarmac = 23,
+}
+impl From<f64> for SurfaceTypeMsfs {
+    fn from(value: f64) -> Self {
+        match value.floor() as u32 {
+            0 => SurfaceTypeMsfs::Concrete,
+            1 => SurfaceTypeMsfs::Grass,
+            2 => SurfaceTypeMsfs::Water,
+            3 => SurfaceTypeMsfs::GrassBumpy,
+            4 => SurfaceTypeMsfs::Asphalt,
+            5 => SurfaceTypeMsfs::ShortGrass,
+            6 => SurfaceTypeMsfs::LongGrass,
+            7 => SurfaceTypeMsfs::HardTurf,
+            8 => SurfaceTypeMsfs::Snow,
+            9 => SurfaceTypeMsfs::Ice,
+            10 => SurfaceTypeMsfs::Urban,
+            11 => SurfaceTypeMsfs::Forest,
+            12 => SurfaceTypeMsfs::Dirt,
+            13 => SurfaceTypeMsfs::Coral,
+            14 => SurfaceTypeMsfs::Gravel,
+            15 => SurfaceTypeMsfs::OilTreated,
+            16 => SurfaceTypeMsfs::SteelMats,
+            17 => SurfaceTypeMsfs::Bituminus,
+            18 => SurfaceTypeMsfs::Brick,
+            19 => SurfaceTypeMsfs::Macadam,
+            20 => SurfaceTypeMsfs::Planks,
+            21 => SurfaceTypeMsfs::Sand,
+            22 => SurfaceTypeMsfs::Shale,
+            23 => SurfaceTypeMsfs::Tarmac,
+            _ => SurfaceTypeMsfs::Macadam,
+        }
     }
 }
 
@@ -141,6 +203,7 @@ pub struct UpdateContext {
     ambient_temperature_id: VariableIdentifier,
     indicated_airspeed_id: VariableIdentifier,
     true_airspeed_id: VariableIdentifier,
+    ground_speed_id: VariableIdentifier,
     indicated_altitude_id: VariableIdentifier,
     pressure_altitude_id: VariableIdentifier,
     is_on_ground_id: VariableIdentifier,
@@ -162,12 +225,26 @@ pub struct UpdateContext {
     mach_number_id: VariableIdentifier,
     plane_height_id: VariableIdentifier,
     latitude_id: VariableIdentifier,
+    total_weight_id: VariableIdentifier,
+    total_yaw_inertia_id: VariableIdentifier,
+    total_pitch_inertia_id: VariableIdentifier,
+    precipitation_rate_id: VariableIdentifier,
+    in_cloud_id: VariableIdentifier,
+    surface_id: VariableIdentifier,
+    rotation_acc_x_id: VariableIdentifier,
+    rotation_acc_y_id: VariableIdentifier,
+    rotation_acc_z_id: VariableIdentifier,
+    rotation_vel_x_id: VariableIdentifier,
+    rotation_vel_y_id: VariableIdentifier,
+    rotation_vel_z_id: VariableIdentifier,
+    aircraft_preset_quick_mode_id: VariableIdentifier,
 
     delta: Delta,
     simulation_time: f64,
     is_ready: bool,
     indicated_airspeed: Velocity,
     true_airspeed: Velocity,
+    ground_speed: Velocity,
     indicated_altitude: Length,
     pressure_altitude: Length,
     ambient_temperature: ThermodynamicTemperature,
@@ -176,6 +253,7 @@ pub struct UpdateContext {
     vertical_speed: Velocity,
 
     local_acceleration: LocalAcceleration,
+    local_acceleration_plane_reference: Vector3<f64>,
     local_acceleration_plane_reference_filtered: LowPassFilter<Vector3<f64>>,
 
     world_ambient_wind: Velocity3D,
@@ -187,10 +265,32 @@ pub struct UpdateContext {
     true_heading: Angle,
     plane_height_over_ground: Length,
     latitude: Angle,
+
+    total_weight: Mass,
+    total_yaw_inertia_slug_foot_squared: f64,
+    total_pitch_inertia_slug_foot_squared: f64,
+
+    // From msfs in millimeters
+    precipitation_rate: Length,
+
+    in_cloud: bool,
+
+    surface: SurfaceTypeMsfs,
+
+    rotation_accel: Vector3<AngularAcceleration>,
+    rotation_vel: Vector3<AngularVelocity>,
+
+    /// This is set by the Aircraft Presets to facilitate quick startup or shutdown of the aircraft.
+    /// In the context of the apu this means quick startup or shutdown of the apu, and no cooldown
+    /// after using Bleed Air.
+    aircraft_preset_quick_mode: bool,
 }
 impl UpdateContext {
+    pub(crate) const GROUND_SPEED_KEY: &'static str = "GPS GROUND SPEED";
     pub(crate) const IS_READY_KEY: &'static str = "IS_READY";
     pub(crate) const AMBIENT_DENSITY_KEY: &'static str = "AMBIENT DENSITY";
+    pub(crate) const IN_CLOUD_KEY: &'static str = "AMBIENT IN CLOUD";
+    pub(crate) const AMBIENT_PRECIP_RATE_KEY: &'static str = "AMBIENT PRECIP RATE";
     pub(crate) const AMBIENT_TEMPERATURE_KEY: &'static str = "AMBIENT TEMPERATURE";
     pub(crate) const INDICATED_AIRSPEED_KEY: &'static str = "AIRSPEED INDICATED";
     pub(crate) const TRUE_AIRSPEED_KEY: &'static str = "AIRSPEED TRUE";
@@ -201,7 +301,10 @@ impl UpdateContext {
     pub(crate) const VERTICAL_SPEED_KEY: &'static str = "VELOCITY WORLD Y";
     pub(crate) const ACCEL_BODY_X_KEY: &'static str = "ACCELERATION BODY X";
     pub(crate) const ACCEL_BODY_Y_KEY: &'static str = "ACCELERATION BODY Y";
-    pub(crate) const ACCEL_BODY_Z_KEY: &'static str = "ACCELERATION BODY Z";
+
+    // Acceleration that includes the reverser acceleration added by our systems to msfs
+    pub(crate) const ACCEL_BODY_Z_KEY: &'static str = "ACCELERATION_BODY_Z_WITH_REVERSER";
+
     pub(crate) const WIND_VELOCITY_X_KEY: &'static str = "AMBIENT WIND X";
     pub(crate) const WIND_VELOCITY_Y_KEY: &'static str = "AMBIENT WIND Y";
     pub(crate) const WIND_VELOCITY_Z_KEY: &'static str = "AMBIENT WIND Z";
@@ -214,10 +317,24 @@ impl UpdateContext {
     pub(crate) const LOCAL_VERTICAL_SPEED_KEY: &'static str = "VELOCITY BODY Y";
     pub(crate) const ALT_ABOVE_GROUND_KEY: &'static str = "PLANE ALT ABOVE GROUND";
     pub(crate) const LATITUDE_KEY: &'static str = "PLANE LATITUDE";
+    pub(crate) const TOTAL_WEIGHT_KEY: &'static str = "TOTAL WEIGHT";
+    pub(crate) const TOTAL_YAW_INERTIA: &'static str = "TOTAL WEIGHT YAW MOI";
+    pub(crate) const TOTAL_PITCH_INERTIA: &'static str = "TOTAL WEIGHT PITCH MOI";
+    pub(crate) const SURFACE_KEY: &'static str = "SURFACE TYPE";
+    pub(crate) const ROTATION_ACCEL_X_KEY: &'static str = "ROTATION ACCELERATION BODY X";
+    pub(crate) const ROTATION_ACCEL_Y_KEY: &'static str = "ROTATION ACCELERATION BODY Y";
+    pub(crate) const ROTATION_ACCEL_Z_KEY: &'static str = "ROTATION ACCELERATION BODY Z";
+    pub(crate) const ROTATION_VEL_X_KEY: &'static str = "ROTATION VELOCITY BODY X";
+    pub(crate) const ROTATION_VEL_Y_KEY: &'static str = "ROTATION VELOCITY BODY Y";
+    pub(crate) const ROTATION_VEL_Z_KEY: &'static str = "ROTATION VELOCITY BODY Z";
+    pub(crate) const AIRCRAFT_PRESET_QUICK_MODE_KEY: &'static str = "AIRCRAFT_PRESET_QUICK_MODE";
 
     // Plane accelerations can become crazy with msfs collision handling.
     // Having such filtering limits high frequencies transients in accelerations used for physics
     const PLANE_ACCELERATION_FILTERING_TIME_CONSTANT: Duration = Duration::from_millis(400);
+
+    // No UOM unit available for inertia
+    const SLUG_FOOT_SQUARED_TO_KG_METER_SQUARED_CONVERSION: f64 = 1.3558179619;
 
     #[deprecated(
         note = "Do not create UpdateContext directly. Instead use the SimulationTestBed or your own custom test bed."
@@ -228,6 +345,7 @@ impl UpdateContext {
         simulation_time: f64,
         indicated_airspeed: Velocity,
         true_airspeed: Velocity,
+        ground_speed: Velocity,
         indicated_altitude: Length,
         pressure_altitude: Length,
         ambient_temperature: ThermodynamicTemperature,
@@ -246,6 +364,7 @@ impl UpdateContext {
                 .get_identifier(Self::AMBIENT_TEMPERATURE_KEY.to_owned()),
             indicated_airspeed_id: context.get_identifier(Self::INDICATED_AIRSPEED_KEY.to_owned()),
             true_airspeed_id: context.get_identifier(Self::TRUE_AIRSPEED_KEY.to_owned()),
+            ground_speed_id: context.get_identifier(Self::GROUND_SPEED_KEY.to_owned()),
             indicated_altitude_id: context.get_identifier(Self::INDICATED_ALTITUDE_KEY.to_owned()),
             pressure_altitude_id: context.get_identifier(Self::PRESSURE_ALTITUDE_KEY.to_owned()),
             is_on_ground_id: context.get_identifier(Self::IS_ON_GROUND_KEY.to_owned()),
@@ -270,12 +389,30 @@ impl UpdateContext {
             mach_number_id: context.get_identifier(Self::MACH_NUMBER_KEY.to_owned()),
             plane_height_id: context.get_identifier(Self::ALT_ABOVE_GROUND_KEY.to_owned()),
             latitude_id: context.get_identifier(Self::LATITUDE_KEY.to_owned()),
+            total_weight_id: context.get_identifier(Self::TOTAL_WEIGHT_KEY.to_owned()),
+            total_yaw_inertia_id: context.get_identifier(Self::TOTAL_YAW_INERTIA.to_owned()),
+            total_pitch_inertia_id: context.get_identifier(Self::TOTAL_PITCH_INERTIA.to_owned()),
+
+            precipitation_rate_id: context.get_identifier(Self::AMBIENT_PRECIP_RATE_KEY.to_owned()),
+            in_cloud_id: context.get_identifier(Self::IN_CLOUD_KEY.to_owned()),
+
+            surface_id: context.get_identifier(Self::SURFACE_KEY.to_owned()),
+            rotation_acc_x_id: context.get_identifier(Self::ROTATION_ACCEL_X_KEY.to_owned()),
+            rotation_acc_y_id: context.get_identifier(Self::ROTATION_ACCEL_Y_KEY.to_owned()),
+            rotation_acc_z_id: context.get_identifier(Self::ROTATION_ACCEL_Z_KEY.to_owned()),
+            rotation_vel_x_id: context.get_identifier(Self::ROTATION_VEL_X_KEY.to_owned()),
+            rotation_vel_y_id: context.get_identifier(Self::ROTATION_VEL_Y_KEY.to_owned()),
+            rotation_vel_z_id: context.get_identifier(Self::ROTATION_VEL_Z_KEY.to_owned()),
+
+            aircraft_preset_quick_mode_id: context
+                .get_identifier(Self::AIRCRAFT_PRESET_QUICK_MODE_KEY.to_owned()),
 
             delta: delta.into(),
             simulation_time,
             is_ready: true,
             indicated_airspeed,
             true_airspeed,
+            ground_speed,
             indicated_altitude,
             pressure_altitude,
             ambient_temperature,
@@ -287,6 +424,7 @@ impl UpdateContext {
                 vertical_acceleration,
                 longitudinal_acceleration,
             ),
+            local_acceleration_plane_reference: Vector3::new(0., -9.8, 0.),
             local_acceleration_plane_reference_filtered:
                 LowPassFilter::<Vector3<f64>>::new_with_init_value(
                     Self::PLANE_ACCELERATION_FILTERING_TIME_CONSTANT,
@@ -314,6 +452,18 @@ impl UpdateContext {
             true_heading: Default::default(),
             plane_height_over_ground: Length::default(),
             latitude,
+            total_weight: Mass::default(),
+            total_yaw_inertia_slug_foot_squared: 10.,
+            total_pitch_inertia_slug_foot_squared: 10.,
+            precipitation_rate: Length::default(),
+            in_cloud: false,
+
+            surface: SurfaceTypeMsfs::Asphalt,
+
+            rotation_accel: Vector3::default(),
+            rotation_vel: Vector3::default(),
+
+            aircraft_preset_quick_mode: false,
         }
     }
 
@@ -323,6 +473,7 @@ impl UpdateContext {
             ambient_temperature_id: context.get_identifier("AMBIENT TEMPERATURE".to_owned()),
             indicated_airspeed_id: context.get_identifier("AIRSPEED INDICATED".to_owned()),
             true_airspeed_id: context.get_identifier("AIRSPEED TRUE".to_owned()),
+            ground_speed_id: context.get_identifier("GPS GROUND SPEED".to_owned()),
             indicated_altitude_id: context.get_identifier("INDICATED ALTITUDE".to_owned()),
             pressure_altitude_id: context.get_identifier("PRESSURE ALTITUDE".to_owned()),
             is_on_ground_id: context.get_identifier("SIM ON GROUND".to_owned()),
@@ -334,7 +485,7 @@ impl UpdateContext {
             local_vertical_speed_id: context.get_identifier("VELOCITY BODY Y".to_owned()),
             accel_body_x_id: context.get_identifier("ACCELERATION BODY X".to_owned()),
             accel_body_y_id: context.get_identifier("ACCELERATION BODY Y".to_owned()),
-            accel_body_z_id: context.get_identifier("ACCELERATION BODY Z".to_owned()),
+            accel_body_z_id: context.get_identifier("ACCELERATION_BODY_Z_WITH_REVERSER".to_owned()),
             wind_velocity_x_id: context.get_identifier("AMBIENT WIND X".to_owned()),
             wind_velocity_y_id: context.get_identifier("AMBIENT WIND Y".to_owned()),
             wind_velocity_z_id: context.get_identifier("AMBIENT WIND Z".to_owned()),
@@ -344,12 +495,30 @@ impl UpdateContext {
             mach_number_id: context.get_identifier("AIRSPEED MACH".to_owned()),
             plane_height_id: context.get_identifier("PLANE ALT ABOVE GROUND".to_owned()),
             latitude_id: context.get_identifier("PLANE LATITUDE".to_owned()),
+            total_weight_id: context.get_identifier("TOTAL WEIGHT".to_owned()),
+            total_yaw_inertia_id: context.get_identifier("TOTAL WEIGHT YAW MOI".to_owned()),
+            total_pitch_inertia_id: context.get_identifier("TOTAL WEIGHT PITCH MOI".to_owned()),
+            precipitation_rate_id: context.get_identifier("AMBIENT PRECIP RATE".to_owned()),
+            in_cloud_id: context.get_identifier("AMBIENT IN CLOUD".to_owned()),
+
+            surface_id: context.get_identifier("SURFACE TYPE".to_owned()),
+
+            rotation_acc_x_id: context.get_identifier(Self::ROTATION_ACCEL_X_KEY.to_owned()),
+            rotation_acc_y_id: context.get_identifier(Self::ROTATION_ACCEL_Y_KEY.to_owned()),
+            rotation_acc_z_id: context.get_identifier(Self::ROTATION_ACCEL_Z_KEY.to_owned()),
+            rotation_vel_x_id: context.get_identifier(Self::ROTATION_VEL_X_KEY.to_owned()),
+            rotation_vel_y_id: context.get_identifier(Self::ROTATION_VEL_Y_KEY.to_owned()),
+            rotation_vel_z_id: context.get_identifier(Self::ROTATION_VEL_Z_KEY.to_owned()),
+
+            aircraft_preset_quick_mode_id: context
+                .get_identifier(Self::AIRCRAFT_PRESET_QUICK_MODE_KEY.to_owned()),
 
             delta: Default::default(),
             simulation_time: Default::default(),
             is_ready: Default::default(),
             indicated_airspeed: Default::default(),
             true_airspeed: Default::default(),
+            ground_speed: Default::default(),
             indicated_altitude: Default::default(),
             pressure_altitude: Default::default(),
             ambient_temperature: Default::default(),
@@ -357,7 +526,7 @@ impl UpdateContext {
             is_on_ground: Default::default(),
             vertical_speed: Default::default(),
             local_acceleration: Default::default(),
-
+            local_acceleration_plane_reference: Vector3::new(0., -9.8, 0.),
             local_acceleration_plane_reference_filtered:
                 LowPassFilter::<Vector3<f64>>::new_with_init_value(
                     Self::PLANE_ACCELERATION_FILTERING_TIME_CONSTANT,
@@ -381,10 +550,22 @@ impl UpdateContext {
             ),
             attitude: Default::default(),
             mach_number: Default::default(),
-            air_density: MassDensity::new::<kilogram_per_cubic_meter>(1.22),
+            air_density: MassDensity::default(),
             true_heading: Default::default(),
             plane_height_over_ground: Length::default(),
             latitude: Default::default(),
+            total_weight: Mass::default(),
+            total_yaw_inertia_slug_foot_squared: 1.,
+            total_pitch_inertia_slug_foot_squared: 1.,
+            precipitation_rate: Length::default(),
+            in_cloud: false,
+
+            surface: SurfaceTypeMsfs::Asphalt,
+
+            rotation_accel: Vector3::default(),
+            rotation_vel: Vector3::default(),
+
+            aircraft_preset_quick_mode: false,
         }
     }
 
@@ -398,6 +579,7 @@ impl UpdateContext {
         self.ambient_temperature = reader.read(&self.ambient_temperature_id);
         self.indicated_airspeed = reader.read(&self.indicated_airspeed_id);
         self.true_airspeed = reader.read(&self.true_airspeed_id);
+        self.ground_speed = reader.read(&self.ground_speed_id);
         self.indicated_altitude = reader.read(&self.indicated_altitude_id);
         self.pressure_altitude = reader.read(&self.pressure_altitude_id);
         self.is_on_ground = reader.read(&self.is_on_ground_id);
@@ -443,6 +625,39 @@ impl UpdateContext {
 
         self.latitude = reader.read(&self.latitude_id);
 
+        self.total_weight = reader.read(&self.total_weight_id);
+
+        self.total_yaw_inertia_slug_foot_squared = reader.read(&self.total_yaw_inertia_id);
+        self.total_pitch_inertia_slug_foot_squared = reader.read(&self.total_pitch_inertia_id);
+
+        let precipitation_height_millimeter = reader.read(&self.precipitation_rate_id);
+        self.precipitation_rate = Length::new::<millimeter>(precipitation_height_millimeter);
+
+        self.in_cloud = reader.read(&self.in_cloud_id);
+
+        let surface_read: f64 = reader.read(&self.surface_id);
+        self.surface = surface_read.into();
+
+        self.rotation_accel = Vector3::new(
+            AngularAcceleration::new::<radian_per_second_squared>(
+                reader.read(&self.rotation_acc_x_id),
+            ),
+            AngularAcceleration::new::<radian_per_second_squared>(
+                reader.read(&self.rotation_acc_y_id),
+            ),
+            AngularAcceleration::new::<radian_per_second_squared>(
+                reader.read(&self.rotation_acc_z_id),
+            ),
+        );
+
+        self.rotation_vel = Vector3::new(
+            AngularVelocity::new::<degree_per_second>(reader.read(&self.rotation_vel_x_id)),
+            AngularVelocity::new::<degree_per_second>(reader.read(&self.rotation_vel_y_id)),
+            AngularVelocity::new::<degree_per_second>(reader.read(&self.rotation_vel_z_id)),
+        );
+
+        self.aircraft_preset_quick_mode = reader.read(&self.aircraft_preset_quick_mode_id);
+
         self.update_relative_wind();
 
         self.update_local_acceleration_plane_reference(delta);
@@ -461,12 +676,12 @@ impl UpdateContext {
 
         // Total acceleration in plane reference is the gravity in world reference rotated to plane reference. To this we substract
         // the local plane reference to get final local acceleration (if plane falling at 1G final local accel is 1G of gravity - 1G local accel = 0G)
-        let total_acceleration_plane_reference = (pitch_rotation
+        self.local_acceleration_plane_reference = (pitch_rotation
             * (bank_rotation * gravity_acceleration_world_reference))
             - plane_acceleration_plane_reference;
 
         self.local_acceleration_plane_reference_filtered
-            .update(delta, total_acceleration_plane_reference);
+            .update(delta, self.local_acceleration_plane_reference);
     }
 
     /// Relative wind could be directly read from simvar RELATIVE WIND VELOCITY XYZ.
@@ -538,6 +753,10 @@ impl UpdateContext {
         self.true_airspeed
     }
 
+    pub fn ground_speed(&self) -> Velocity {
+        self.ground_speed
+    }
+
     pub fn indicated_altitude(&self) -> Length {
         self.indicated_altitude
     }
@@ -566,6 +785,14 @@ impl UpdateContext {
         self.is_on_ground
     }
 
+    pub fn is_in_cloud(&self) -> bool {
+        self.in_cloud
+    }
+
+    pub fn precipitation_rate(&self) -> Length {
+        self.precipitation_rate
+    }
+
     pub fn long_accel(&self) -> Acceleration {
         self.local_acceleration.long_accel()
     }
@@ -578,8 +805,14 @@ impl UpdateContext {
         self.local_acceleration.vert_accel()
     }
 
+    pub fn surface_type(&self) -> SurfaceTypeMsfs {
+        self.surface
+    }
+
     pub fn local_acceleration_without_gravity(&self) -> Vector3<f64> {
-        self.local_acceleration.to_ms2_vector()
+        // Gives the local acceleration in plane reference. If msfs local accel is free falling -9.81
+        //      then it's locally a up acceleration.
+        -self.local_acceleration.to_ms2_vector()
     }
 
     pub fn local_relative_wind(&self) -> Velocity3D {
@@ -590,12 +823,12 @@ impl UpdateContext {
         self.local_velocity
     }
 
-    pub fn acceleration(&self) -> LocalAcceleration {
-        self.local_acceleration
-    }
-
     pub fn acceleration_plane_reference_filtered_ms2_vector(&self) -> Vector3<f64> {
         self.local_acceleration_plane_reference_filtered.output()
+    }
+
+    pub fn acceleration_plane_reference_unfiltered_ms2_vector(&self) -> Vector3<f64> {
+        self.local_acceleration_plane_reference
     }
 
     pub fn pitch(&self) -> Angle {
@@ -627,6 +860,42 @@ impl UpdateContext {
 
     pub fn plane_height_over_ground(&self) -> Length {
         self.plane_height_over_ground
+    }
+
+    pub fn total_weight(&self) -> Mass {
+        self.total_weight
+    }
+
+    pub fn total_yaw_inertia_kg_m2(&self) -> f64 {
+        self.total_yaw_inertia_slug_foot_squared
+            * Self::SLUG_FOOT_SQUARED_TO_KG_METER_SQUARED_CONVERSION
+    }
+
+    pub fn total_pitch_inertia_kg_m2(&self) -> f64 {
+        self.total_pitch_inertia_slug_foot_squared
+            * Self::SLUG_FOOT_SQUARED_TO_KG_METER_SQUARED_CONVERSION
+    }
+
+    pub fn rotation_acceleration_rad_s2(&self) -> Vector3<f64> {
+        Vector3::new(
+            self.rotation_accel[0].get::<radian_per_second_squared>(),
+            self.rotation_accel[1].get::<radian_per_second_squared>(),
+            self.rotation_accel[2].get::<radian_per_second_squared>(),
+        )
+    }
+
+    pub fn rotation_velocity_rad_s(&self) -> Vector3<f64> {
+        Vector3::new(
+            self.rotation_vel[0].get::<radian_per_second>(),
+            self.rotation_vel[1].get::<radian_per_second>(),
+            self.rotation_vel[2].get::<radian_per_second>(),
+        )
+    }
+
+    /// This is set by the Aircraft Presets to facilitate quick startup or shutdown of the aircraft.
+    /// In the context of the apu this means quick startup or shutdown of the apu, and no cooldown
+    pub fn aircraft_preset_quick_mode(&self) -> bool {
+        self.aircraft_preset_quick_mode
     }
 }
 

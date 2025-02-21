@@ -2,6 +2,7 @@
 
 mod battery;
 mod battery_charge_limiter;
+mod battery_charge_rectifier_unit;
 pub mod consumption;
 mod emergency_generator;
 mod engine_generator;
@@ -16,7 +17,10 @@ use std::{
     time::Duration,
 };
 
-use crate::simulation::{InitContext, VariableIdentifier};
+use crate::{
+    failures::{Failure, FailureType},
+    simulation::{InitContext, VariableIdentifier},
+};
 use crate::{
     shared::{
         ConsumePower, ElectricalBusType, ElectricalBuses, EmergencyElectricalState,
@@ -28,9 +32,11 @@ use crate::{
 };
 pub use battery::Battery;
 pub use battery_charge_limiter::BatteryChargeLimiter;
+pub use battery_charge_rectifier_unit::BatteryChargeRectifierUnit;
 pub use emergency_generator::EmergencyGenerator;
 pub use engine_generator::{
-    EngineGenerator, INTEGRATED_DRIVE_GENERATOR_STABILIZATION_TIME_IN_MILLISECONDS,
+    EngineGenerator, IntegratedDriveGenerator, VariableFrequencyGenerator,
+    INTEGRATED_DRIVE_GENERATOR_STABILIZATION_TIME,
 };
 pub use external_power_source::ExternalPowerSource;
 use fxhash::{FxHashMap, FxHashSet};
@@ -109,6 +115,7 @@ pub struct ElectricalBus {
     bus_potential_normal_id: VariableIdentifier,
     potential: ElectricPotential,
     bus_type: ElectricalBusType,
+    failure: Failure,
 }
 impl ElectricalBus {
     pub fn new(context: &mut InitContext, bus_type: ElectricalBusType) -> ElectricalBus {
@@ -119,6 +126,7 @@ impl ElectricalBus {
                 .get_identifier(format!("ELEC_{}_BUS_POTENTIAL_NORMAL", bus_type)),
             potential: ElectricPotential::new::<volt>(0.),
             bus_type,
+            failure: Failure::new(FailureType::ElectricalBus(bus_type)),
         }
     }
 
@@ -136,10 +144,15 @@ impl ElectricalElement for ElectricalBus {
     }
 
     fn is_conductive(&self) -> bool {
-        true
+        !self.failure.is_active()
     }
 }
 impl SimulationElement for ElectricalBus {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        self.failure.accept(visitor);
+        visitor.visit(self);
+    }
+
     fn write(&self, writer: &mut SimulatorWriter) {
         if let ElectricalBusType::Sub(_) = self.bus_type {
             // Sub buses are not written towards the simulator. See the
@@ -405,8 +418,9 @@ impl Electricity {
     /// Takes the output supplied by the given source of electricity, such that
     /// it can then [flow](`Self::flow()`) through the electrical system.
     /// ```rust
-    /// # use systems::{shared::ElectricalBusType, electrical::{Contactor, ElectricalBus, Electricity, EngineGenerator},
+    /// # use systems::{shared::ElectricalBusType, electrical::{Contactor, ElectricalBus, Electricity, IntegratedDriveGenerator},
     /// # simulation::{InitContext, VariableRegistry, VariableIdentifier}};
+    /// # use uom::si::{f64::Power, power::kilowatt};
     /// # struct SomeVariableRegistry {}
     /// # impl VariableRegistry for SomeVariableRegistry {
     /// #     fn get(&mut self, name: String) -> VariableIdentifier {
@@ -416,7 +430,7 @@ impl Electricity {
     /// # let mut registry = SomeVariableRegistry {};
     /// # let mut electricity = Electricity::new();
     /// # let mut context = InitContext::new(Default::default(), &mut electricity, &mut registry);
-    /// let generator = EngineGenerator::new(&mut context, 1);
+    /// let generator = IntegratedDriveGenerator::new(&mut context, 1, Power::new::<kilowatt>(90.), 390.0..=410.0);
     /// let contactor = Contactor::new(&mut context, "TEST");
     ///
     /// electricity.supplied_by(&generator);

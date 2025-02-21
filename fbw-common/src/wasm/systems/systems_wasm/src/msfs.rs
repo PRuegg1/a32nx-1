@@ -1,11 +1,25 @@
-///! Module declared to be able to compile documentation.
-///! Does not provide any meaningful functionality.
+//! Module declared to be able to compile documentation.
+//! Does not provide any meaningful functionality.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod legacy {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    use msfs::sys::{ID32, UINT32};
+
     pub fn execute_calculator_code<T>(_code: &str) {}
+
+    pub fn trigger_key_event(_event_id: ID32, _value: UINT32) {}
+
+    pub fn trigger_key_event_ex1(
+        _event_id: ID32,
+        _value0: UINT32,
+        _value1: UINT32,
+        _value2: UINT32,
+        _value3: UINT32,
+        _value4: UINT32,
+    ) {
+    }
 
     #[derive(Debug)]
     pub struct AircraftVariable {}

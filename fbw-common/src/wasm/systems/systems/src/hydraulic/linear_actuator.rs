@@ -397,7 +397,6 @@ struct CoreHydraulicForce {
 
     max_flow: VolumeRate,
     min_flow: VolumeRate,
-    flow_error_prev: VolumeRate,
 
     bore_side_area: Area,
     rod_side_area: Area,
@@ -420,7 +419,7 @@ struct CoreHydraulicForce {
     soft_lock_velocity: (AngularVelocity, AngularVelocity),
 }
 impl CoreHydraulicForce {
-    const MIN_MAX_FORCE_CONTROLLER_FILTER_TIME_CONSTANT: Duration = Duration::from_millis(30);
+    const MIN_MAX_FORCE_CONTROLLER_FILTER_TIME_CONSTANT: Duration = Duration::from_millis(1);
 
     const MAX_ABSOLUTE_FORCE_NEWTON: f64 = 500000.;
 
@@ -488,7 +487,7 @@ impl CoreHydraulicForce {
 
             max_flow,
             min_flow,
-            flow_error_prev: VolumeRate::new::<gallon_per_second>(0.),
+
             bore_side_area,
             rod_side_area,
             last_control_force: Force::new::<newton>(0.),
@@ -807,6 +806,22 @@ impl CoreHydraulicForce {
             .set_max(self.max_control_force.output().get::<newton>());
     }
 
+    fn flow_restriction_factor(&self, current_pressure: Pressure) -> f64 {
+        // Selecting old 3000psi vs new hydraulic architecture based on max pressure of the system
+        // New 5000 psi systems have a higher flow degradation with pressure going lower
+        if self.max_working_pressure < Pressure::new::<psi>(4000.) {
+            (1. / (self.max_working_pressure.get::<psi>()
+                - Self::FLOW_REDUCTION_THRESHOLD_BELOW_MAX_PRESS_PSI)
+                * current_pressure.get::<psi>().powi(2)
+                * 1.
+                / (self.max_working_pressure.get::<psi>()
+                    - Self::FLOW_REDUCTION_THRESHOLD_BELOW_MAX_PRESS_PSI))
+                .min(1.)
+        } else {
+            (current_pressure.get::<psi>().powi(3) * (0.00000004 / 5000.)).min(1.)
+        }
+    }
+
     fn force_position_control(
         &mut self,
         context: &UpdateContext,
@@ -817,20 +832,18 @@ impl CoreHydraulicForce {
         speed: Velocity,
     ) -> Force {
         if self.is_dev_tuning_active {
-            self.pid_controller
-                .set_gains(self.test_p_gain, self.test_i_gain, self.test_force_gain);
+            self.pid_controller.set_gains(
+                self.test_p_gain,
+                self.test_i_gain,
+                0.,
+                self.test_force_gain,
+            );
         }
 
         let open_loop_flow_target = self.open_loop_flow(required_position, position_normalized);
 
         let pressure_correction_factor = if self.has_flow_restriction {
-            (1. / (self.max_working_pressure.get::<psi>()
-                - Self::FLOW_REDUCTION_THRESHOLD_BELOW_MAX_PRESS_PSI)
-                * current_pressure.get::<psi>().powi(2)
-                * 1.
-                / (self.max_working_pressure.get::<psi>()
-                    - Self::FLOW_REDUCTION_THRESHOLD_BELOW_MAX_PRESS_PSI))
-                .min(1.)
+            self.flow_restriction_factor(current_pressure)
         } else {
             1.
         };
@@ -873,9 +886,10 @@ impl Debug for CoreHydraulicForce {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "\nCOREHYD => Mode {:?} Force(N) {:.0}",
+            "\nCOREHYD => Mode {:?} Force(N) {:.0} MaxForce {:.0}",
             self.current_mode,
-            self.force().get::<newton>()
+            self.force().get::<newton>(),
+            self.max_control_force.output().get::<newton>(),
         )
     }
 }
@@ -942,7 +956,6 @@ pub struct LinearActuator {
 
     volume_extension_ratio: Ratio,
     signed_flow: VolumeRate,
-    flow_error_prev: VolumeRate,
 
     delta_displacement: Length,
 
@@ -1040,7 +1053,6 @@ impl LinearActuator {
 
             volume_extension_ratio,
             signed_flow: VolumeRate::new::<gallon_per_second>(0.),
-            flow_error_prev: VolumeRate::new::<gallon_per_second>(0.),
 
             delta_displacement: Length::new::<meter>(0.),
 
@@ -1262,12 +1274,18 @@ impl Debug for LinearActuator {
         if self.electro_hydrostatic_backup.is_some() {
             write!(
                 f,
-                "Actuator => Type:EHA {:?} / {:?}",
+                "Actuator => Type:EHA {:?} / {:?} / Current flow gpm{:.3}",
                 self.electro_hydrostatic_backup.unwrap(),
                 self.core_hydraulics,
+                self.signed_flow.get::<gallon_per_minute>()
             )
         } else {
-            write!(f, "Actuator => Type:Standard / {:?}", self.core_hydraulics,)
+            write!(
+                f,
+                "Actuator => Type:Standard / {:?} / Current flow gpm{:.3}",
+                self.core_hydraulics,
+                self.signed_flow.get::<gallon_per_minute>()
+            )
         }
     }
 }
@@ -1330,6 +1348,10 @@ impl<const N: usize> HydraulicLinearActuatorAssembly<N> {
 
     pub fn body(&mut self) -> &mut impl AerodynamicBody {
         &mut self.rigid_body
+    }
+
+    pub fn aerodynamic_torque(&self) -> Torque {
+        self.rigid_body.aerodynamic_torque()
     }
 
     pub fn update(
@@ -1540,6 +1562,8 @@ pub struct LinearActuatedRigidBodyOnHingeAxis {
     angular_acceleration: AngularAcceleration,
     sum_of_torques: Torque,
 
+    aerodynamic_torque: Torque,
+
     position_normalized: Ratio,
     position_normalized_prev: Ratio,
 
@@ -1567,6 +1591,9 @@ pub struct LinearActuatedRigidBodyOnHingeAxis {
 impl LinearActuatedRigidBodyOnHingeAxis {
     // Rebound energy when hiting min or max position. 0.3 means the body rebounds at 30% of the speed it hit the min/max position
     const DEFAULT_MAX_MIN_POSITION_REBOUND_FACTOR: f64 = 0.3;
+
+    // Speed cap for all rigid bodies movements. Avoids chain reaction to numerical instability
+    const MAX_ABSOLUTE_ANGULAR_SPEED_RAD_S: f64 = 8.;
 
     pub fn new(
         mass: Mass,
@@ -1605,15 +1632,16 @@ impl LinearActuatedRigidBodyOnHingeAxis {
             actuator_extension_gives_positive_angle: false,
             anchor_point,
             angular_position: init_angle,
-            angular_speed: AngularVelocity::new::<radian_per_second>(0.),
-            angular_acceleration: AngularAcceleration::new::<radian_per_second_squared>(0.),
-            sum_of_torques: Torque::new::<newton_meter>(0.),
-            position_normalized: Ratio::new::<ratio>(0.),
-            position_normalized_prev: Ratio::new::<ratio>(0.),
+            angular_speed: AngularVelocity::default(),
+            angular_acceleration: AngularAcceleration::default(),
+            sum_of_torques: Torque::default(),
+            aerodynamic_torque: Torque::default(),
+            position_normalized: Ratio::default(),
+            position_normalized_prev: Ratio::default(),
             mass,
             inertia_at_hinge,
             natural_damping_constant,
-            lock_position_request: Ratio::new::<ratio>(0.),
+            lock_position_request: Ratio::default(),
             is_lock_requested: locked,
             is_locked: locked,
             axis_direction,
@@ -1666,9 +1694,9 @@ impl LinearActuatedRigidBodyOnHingeAxis {
             aerodynamic_force[2].get::<newton>(),
         ));
 
-        let torque_value = Torque::new::<newton_meter>(self.axis_direction.dot(&torque));
+        self.aerodynamic_torque = Torque::new::<newton_meter>(self.axis_direction.dot(&torque));
 
-        self.sum_of_torques += torque_value;
+        self.sum_of_torques += self.aerodynamic_torque;
     }
 
     pub fn apply_global_angle_offset(&mut self, offset: Angle) {
@@ -1700,6 +1728,10 @@ impl LinearActuatedRigidBodyOnHingeAxis {
         } else {
             -self.lock_position_request.get::<ratio>() * self.total_travel + self.max_angle
         }
+    }
+
+    pub fn aerodynamic_torque(&self) -> Torque {
+        self.aerodynamic_torque
     }
 
     pub fn position_normalized(&self) -> Ratio {
@@ -1778,6 +1810,7 @@ impl LinearActuatedRigidBodyOnHingeAxis {
                     * context.delta_as_secs_f64(),
             );
 
+            self.limit_absolute_angular_speed();
             self.limit_angular_speed_from_soft_lock();
 
             self.angular_position += Angle::new::<radian>(
@@ -1816,6 +1849,16 @@ impl LinearActuatedRigidBodyOnHingeAxis {
                 .min(self.max_soft_lock_velocity)
                 .max(self.min_soft_lock_velocity);
         }
+    }
+
+    fn limit_absolute_angular_speed(&mut self) {
+        let max_angular_speed =
+            AngularVelocity::new::<radian_per_second>(Self::MAX_ABSOLUTE_ANGULAR_SPEED_RAD_S);
+
+        self.angular_speed = self
+            .angular_speed
+            .min(max_angular_speed)
+            .max(-max_angular_speed);
     }
 
     fn limit_position_to_range(&mut self) {
@@ -2216,7 +2259,7 @@ mod tests {
                 .update(context, &self.controllers[..], self.pressures);
 
             println!(
-                "Body angle {:.2} Body Npos {:.3}, Act Npos {:.3}, Act force {:.1} , Fluid used act0 {:.5}",
+                "Body angle {:.2} Body Npos {:.3}, Act Npos {:.3}, Act force {:.1} , Fluid used act0 {:.5} Flow gps{:.4}",
                 self.hydraulic_assembly
                     .rigid_body
                     .angular_position
@@ -2231,7 +2274,8 @@ mod tests {
                 self.hydraulic_assembly.linear_actuators[0]
                     .force()
                     .get::<newton>(),
-                self.hydraulic_assembly.linear_actuators[0].used_volume().get::<gallon>()
+                self.hydraulic_assembly.linear_actuators[0].used_volume().get::<gallon>(),
+                self.hydraulic_assembly.linear_actuators[0].signed_flow().get::<gallon_per_second>()
             );
         }
 
@@ -3911,6 +3955,29 @@ mod tests {
         assert!(test_bed.query(|a| a.actuator_used_volume(0).get::<gallon>()) <= 0.0001);
     }
 
+    #[test]
+    fn linear_actuator_can_move_heavy_door_up() {
+        let mut test_bed = SimulationTestBed::new(|context| {
+            let tested_object = cargo_door_assembly_heavy(context, true);
+            TestAircraft::new(context, tested_object)
+        });
+
+        let actuator_position_init = test_bed.query(|a| a.body_position());
+
+        test_bed.command(|a| a.command_unlock());
+        test_bed.command(|a| a.command_position_control(Ratio::new::<ratio>(1.1), 0));
+
+        test_bed.command(|a| a.set_pressures([Pressure::new::<psi>(5000.)]));
+
+        test_bed.run_with_delta(Duration::from_secs(1));
+
+        assert!(test_bed.query(|a| a.body_position()) > actuator_position_init);
+
+        test_bed.run_with_delta(Duration::from_secs(33));
+
+        assert!(test_bed.query(|a| a.body_position()) > Ratio::new::<ratio>(0.9));
+    }
+
     fn cargo_door_actuator(
         context: &mut InitContext,
         bounded_linear_length: &impl BoundedLinearLength,
@@ -3925,7 +3992,7 @@ mod tests {
             2,
             Length::new::<meter>(0.04422),
             Length::new::<meter>(0.03366),
-            VolumeRate::new::<gallon_per_second>(0.008),
+            VolumeRate::new::<gallon_per_second>(0.01),
             800000.,
             15000.,
             50000.,
@@ -3945,12 +4012,56 @@ mod tests {
         )
     }
 
+    fn cargo_door_actuator_heavy(
+        context: &mut InitContext,
+        bounded_linear_length: &impl BoundedLinearLength,
+    ) -> LinearActuator {
+        const DEFAULT_I_GAIN: f64 = 4.;
+        const DEFAULT_P_GAIN: f64 = 0.05;
+        const DEFAULT_FORCE_GAIN: f64 = 200000.;
+
+        LinearActuator::new(
+            context,
+            bounded_linear_length,
+            1,
+            Length::new::<meter>(0.06651697090182), // Real actuator 34.75cm^2
+            Length::new::<meter>(0.0509),
+            VolumeRate::new::<gallon_per_second>(0.02),
+            800000.,
+            15000.,
+            50000.,
+            1200000.,
+            Duration::from_millis(100),
+            [1., 1., 1., 1., 1., 1.],
+            [1., 1., 1., 1., 1., 1.],
+            [0., 0.2, 0.21, 0.79, 0.8, 1.],
+            DEFAULT_P_GAIN,
+            DEFAULT_I_GAIN,
+            DEFAULT_FORCE_GAIN,
+            false,
+            false,
+            None,
+            None,
+            Pressure::new::<psi>(5250.),
+        )
+    }
+
     fn cargo_door_assembly(
         context: &mut InitContext,
         is_locked: bool,
     ) -> HydraulicLinearActuatorAssembly<1> {
         let rigid_body = cargo_door_body(is_locked);
         let actuator = cargo_door_actuator(context, &rigid_body);
+
+        HydraulicLinearActuatorAssembly::new([actuator], rigid_body)
+    }
+
+    fn cargo_door_assembly_heavy(
+        context: &mut InitContext,
+        is_locked: bool,
+    ) -> HydraulicLinearActuatorAssembly<1> {
+        let rigid_body = cargo_door_body_heavy(is_locked);
+        let actuator = cargo_door_actuator_heavy(context, &rigid_body);
 
         HydraulicLinearActuatorAssembly::new([actuator], rigid_body)
     }
@@ -3975,6 +4086,30 @@ mod tests {
             100.,
             is_locked,
             Vector3::new(0., 0., 1.),
+        )
+    }
+
+    fn cargo_door_body_heavy(is_locked: bool) -> LinearActuatedRigidBodyOnHingeAxis {
+        let size = Vector3::new(100. / 1000., 1855. / 1000., 2025. / 1000.);
+        let cg_offset = Vector3::new(0., -size[1] / 2., 0.);
+
+        let control_arm = Vector3::new(0., -0.45, 0.);
+        let anchor = Vector3::new(-0.7596, -0.4, 0.);
+        let axis_direction = Vector3::new(0., 0., 1.);
+
+        LinearActuatedRigidBodyOnHingeAxis::new(
+            Mass::new::<kilogram>(250.),
+            size,
+            cg_offset,
+            cg_offset,
+            control_arm,
+            anchor,
+            Angle::new::<degree>(-23.),
+            Angle::new::<degree>(136.),
+            Angle::new::<degree>(-23.),
+            100.,
+            is_locked,
+            axis_direction,
         )
     }
 

@@ -1,20 +1,25 @@
 use crate::{
-    electrical::{ElectricalElement, ElectricitySource, Potential},
+    apu::ApuGenerator,
+    electrical::{ElectricalElement, Potential},
     pneumatic::{EngineModeSelector, EngineState, PneumaticValveSignal},
     simulation::UpdateContext,
 };
 
 use arinc429::Arinc429Word;
 use nalgebra::Vector3;
+use ntest::MaxDifference;
 use num_derive::FromPrimitive;
 use std::{cell::Ref, fmt::Display, time::Duration};
 use uom::si::{
+    angle::radian,
     f64::*,
     length::meter,
     mass_rate::kilogram_per_second,
     pressure::{hectopascal, pascal},
     ratio::ratio,
     thermodynamic_temperature::{degree_celsius, kelvin},
+    velocity::knot,
+    Quantity,
 };
 
 pub mod low_pass_filter;
@@ -35,10 +40,9 @@ pub trait ReservoirAirPressure {
     fn yellow_reservoir_pressure(&self) -> Pressure;
 }
 
-pub trait AuxiliaryPowerUnitElectrical:
-    ControllerSignal<ContactorSignal> + ApuAvailable + ElectricalElement + ElectricitySource
-{
-    fn output_within_normal_parameters(&self) -> bool;
+pub trait AuxiliaryPowerUnitElectrical: ControllerSignal<ContactorSignal> + ApuAvailable {
+    type Generator: ApuGenerator;
+    fn generator(&self, number: usize) -> &Self::Generator;
 }
 
 pub trait ApuAvailable {
@@ -90,6 +94,11 @@ pub trait FeedbackPositionPickoffUnit {
     fn angle(&self) -> Angle;
 }
 
+pub trait CargoDoorLocked {
+    fn fwd_cargo_door_locked(&self) -> bool;
+    fn aft_cargo_door_locked(&self) -> bool;
+}
+
 pub trait LgciuWeightOnWheels {
     fn right_gear_compressed(&self, treat_ext_pwr_as_ground: bool) -> bool;
     fn right_gear_extended(&self, treat_ext_pwr_as_ground: bool) -> bool;
@@ -135,6 +144,10 @@ pub trait TrimmableHorizontalStabilizer {
 pub trait LgciuInterface:
     LgciuWeightOnWheels + LgciuGearExtension + LgciuDoorPosition + LgciuGearControl + LandingGearHandle
 {
+}
+
+pub trait ReverserPosition {
+    fn reverser_position(&self) -> Ratio;
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -209,21 +222,13 @@ pub trait CabinSimulation {
     }
 }
 
-pub trait PressurizationOverheadShared {
-    fn is_in_man_mode(&self) -> bool;
-    fn ditching_is_on(&self) -> bool;
-    fn ldg_elev_is_auto(&self) -> bool;
-    fn ldg_elev_knob_value(&self) -> f64;
-}
-
 pub trait PneumaticBleed {
     fn apu_bleed_is_on(&self) -> bool;
     fn engine_crossbleed_is_on(&self) -> bool;
 }
 
 pub trait EngineStartState {
-    fn left_engine_state(&self) -> EngineState;
-    fn right_engine_state(&self) -> EngineState;
+    fn engine_state(&self, engine_number: usize) -> EngineState;
     fn engine_mode_selector(&self) -> EngineModeSelector;
 }
 
@@ -232,9 +237,10 @@ pub trait EngineBleedPushbutton<const N: usize> {
 }
 
 pub trait PackFlowValveState {
-    // Pack id is 1 or 2
+    /// Pack flow valve id is 1, 2, 3 or 4
     fn pack_flow_valve_is_open(&self, pack_id: usize) -> bool;
     fn pack_flow_valve_air_flow(&self, pack_id: usize) -> MassRate;
+    fn pack_flow_valve_inlet_pressure(&self, pack_id: usize) -> Option<Pressure>;
 }
 
 pub trait AdirsMeasurementOutputs {
@@ -245,19 +251,22 @@ pub trait AdirsMeasurementOutputs {
     fn true_heading(&self, adiru_number: usize) -> Arinc429Word<Angle>;
     fn vertical_speed(&self, adiru_number: usize) -> Arinc429Word<Velocity>;
     fn altitude(&self, adiru_number: usize) -> Arinc429Word<Length>;
+    fn angle_of_attack(&self, adiru_number: usize) -> Arinc429Word<Angle>;
 }
 
 pub trait AdirsDiscreteOutputs {
-    fn low_speed_warning_1_104kts(&self, adiru_number: usize) -> bool;
-    fn low_speed_warning_2_54kts(&self, adiru_number: usize) -> bool;
-    fn low_speed_warning_3_159kts(&self, adiru_number: usize) -> bool;
-    fn low_speed_warning_4_260kts(&self, adiru_number: usize) -> bool;
+    fn low_speed_warning_1(&self, adiru_number: usize) -> bool;
+    fn low_speed_warning_2(&self, adiru_number: usize) -> bool;
+    fn low_speed_warning_3(&self, adiru_number: usize) -> bool;
+    fn low_speed_warning_4(&self, adiru_number: usize) -> bool;
 }
 
 pub enum GearWheel {
     NOSE = 0,
     LEFT = 1,
     RIGHT = 2,
+    WINGLEFT = 3,
+    WINGRIGHT = 4,
 }
 
 pub trait SectionPressure {
@@ -322,6 +331,7 @@ pub enum AirbusElectricPumpId {
     Green,
     Blue,
     Yellow,
+    GreenAux,
 }
 impl Display for AirbusElectricPumpId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -333,8 +343,19 @@ impl Display for AirbusElectricPumpId {
             AirbusElectricPumpId::Green => write!(f, "GREEN"),
             AirbusElectricPumpId::Blue => write!(f, "BLUE"),
             AirbusElectricPumpId::Yellow => write!(f, "YELLOW"),
+            AirbusElectricPumpId::GreenAux => write!(f, "GREEN_AUX"),
         }
     }
+}
+
+/// Access to all aircraft surfaces positions
+pub trait SurfacesPositions {
+    fn left_spoilers_positions(&self) -> &[f64];
+    fn right_spoilers_positions(&self) -> &[f64];
+    fn left_ailerons_positions(&self) -> &[f64];
+    fn right_ailerons_positions(&self) -> &[f64];
+    fn left_flaps_position(&self) -> f64;
+    fn right_flaps_position(&self) -> f64;
 }
 
 /// The common types of electrical buses within Airbus aircraft.
@@ -346,12 +367,14 @@ pub enum ElectricalBusType {
     AlternatingCurrentEssentialShed,
     AlternatingCurrentStaticInverter,
     AlternatingCurrentGndFltService,
+    AlternatingCurrentNamed(&'static str),
     DirectCurrent(u8),
     DirectCurrentEssential,
     DirectCurrentEssentialShed,
     DirectCurrentBattery,
     DirectCurrentHot(u8),
     DirectCurrentGndFltService,
+    DirectCurrentNamed(&'static str),
 
     /// A sub bus is a subsection of a larger bus. An example of
     /// a sub bus is the A320's 202PP, which is a sub bus of DC BUS 2 (2PP).
@@ -375,12 +398,14 @@ impl Display for ElectricalBusType {
             ElectricalBusType::AlternatingCurrentEssentialShed => write!(f, "AC_ESS_SHED"),
             ElectricalBusType::AlternatingCurrentStaticInverter => write!(f, "AC_STAT_INV"),
             ElectricalBusType::AlternatingCurrentGndFltService => write!(f, "AC_GND_FLT_SVC"),
+            ElectricalBusType::AlternatingCurrentNamed(name) => write!(f, "{}", name),
             ElectricalBusType::DirectCurrent(number) => write!(f, "DC_{}", number),
             ElectricalBusType::DirectCurrentEssential => write!(f, "DC_ESS"),
             ElectricalBusType::DirectCurrentEssentialShed => write!(f, "DC_ESS_SHED"),
             ElectricalBusType::DirectCurrentBattery => write!(f, "DC_BAT"),
             ElectricalBusType::DirectCurrentHot(number) => write!(f, "DC_HOT_{}", number),
             ElectricalBusType::DirectCurrentGndFltService => write!(f, "DC_GND_FLT_SVC"),
+            ElectricalBusType::DirectCurrentNamed(name) => write!(f, "{}", name),
             ElectricalBusType::Sub(name) => write!(f, "SUB_{}", name),
         }
     }
@@ -449,20 +474,27 @@ pub trait ConsumePower: PowerConsumptionReport {
 pub trait ControllerSignal<S> {
     fn signal(&self) -> Option<S>;
 }
+#[macro_export]
+macro_rules! valve_signal_implementation {
+    ($signal_type: ty) => {
+        impl PneumaticValveSignal for $signal_type {
+            fn new(target_open_amount: Ratio) -> Self {
+                Self { target_open_amount }
+            }
+
+            fn target_open_amount(&self) -> Ratio {
+                self.target_open_amount
+            }
+        }
+    };
+}
 
 #[derive(Clone, Copy)]
 pub struct ApuBleedAirValveSignal {
     target_open_amount: Ratio,
 }
-impl PneumaticValveSignal for ApuBleedAirValveSignal {
-    fn new(target_open_amount: Ratio) -> Self {
-        Self { target_open_amount }
-    }
 
-    fn target_open_amount(&self) -> Ratio {
-        self.target_open_amount
-    }
-}
+valve_signal_implementation!(ApuBleedAirValveSignal);
 
 pub trait PneumaticValve {
     fn is_open(&self) -> bool;
@@ -561,12 +593,7 @@ impl DelayedPulseTrueLogicGate {
 
         let gate_out = self.true_delayed_gate.output();
 
-        if gate_out && !self.last_gate_output {
-            self.output = true;
-        } else {
-            self.output = false;
-        }
-
+        self.output = gate_out && !self.last_gate_output;
         self.last_gate_output = gate_out;
     }
 
@@ -603,6 +630,26 @@ impl DelayedFalseLogicGate {
 
     pub fn output(&self) -> bool {
         self.expression_result || self.delay > self.false_duration
+    }
+}
+
+/// The latched logic gate latches the true result of a given expression.
+/// As soon as the output is true it stays true until it is reset.
+#[derive(Default)]
+pub struct LatchedTrueLogicGate {
+    expression_result: bool,
+}
+impl LatchedTrueLogicGate {
+    pub fn update(&mut self, expression_result: bool) {
+        self.expression_result = self.expression_result || expression_result;
+    }
+
+    pub fn reset(&mut self) {
+        self.expression_result = false;
+    }
+
+    pub fn output(&self) -> bool {
+        self.expression_result
     }
 }
 
@@ -667,6 +714,17 @@ pub fn to_bool(value: f64) -> bool {
     (value - 1.).abs() < f64::EPSILON
 }
 
+/// Normalise angle degrees value between 0 and 360
+pub fn normalise_angle(angle_degrees: f64) -> f64 {
+    let raw = angle_degrees % 360.;
+
+    if raw >= 0. {
+        raw
+    } else {
+        raw + 360.
+    }
+}
+
 /// Returns the height over the ground of any point of the plane considering its current attitude
 /// Offset parameter is the position of the point in plane reference with respect to datum reference point
 /// X positive from left to right
@@ -682,6 +740,57 @@ pub fn height_over_ground(
     Length::new::<meter>(offset_including_plane_rotation[1]) + context.plane_height_over_ground()
 }
 
+// Gets the local acceleration at a point away from plane reference point, including rotational effects (tangential/centripetal)
+// Warning: It EXLCLUDES PLANE LOCAL CG ACCELERATION. Add to plane acceleration to have total local acceleration at this point
+//
+// For reference rotational velocity and acceleration from MSFS are:
+//      X axis pitch up negative
+//      Y axis yaw left negative
+//      Z axis roll right negative
+//
+// Acceleration returned is local to plane reference with
+//      X negative left positive right
+//      Y negative down positive up
+//      Z negative aft positive forward
+pub fn local_acceleration_at_plane_coordinate(
+    context: &UpdateContext,
+    offset_from_plane_reference: Vector3<f64>,
+) -> Vector3<f64> {
+    // If less than 10cm from center of rotation we don't consider rotational effect
+    if offset_from_plane_reference.norm() < 0.01 {
+        return Vector3::default();
+    }
+
+    let tangential_velocity_of_point =
+        offset_from_plane_reference.cross(&-context.rotation_velocity_rad_s());
+    let tangential_acceleration_of_point =
+        offset_from_plane_reference.cross(&-context.rotation_acceleration_rad_s2());
+
+    let radial_norm_vector = -offset_from_plane_reference.normalize();
+
+    let centripetal_acceleration = radial_norm_vector
+        * (tangential_velocity_of_point.norm().powi(2) / offset_from_plane_reference.norm());
+
+    centripetal_acceleration + tangential_acceleration_of_point
+}
+
+/// Gives the steering angle for a wheel that would freely caster if plane is rotating on yaw axis
+pub fn steering_angle_from_plane_yaw_rate(
+    context: &UpdateContext,
+    wheel_distance_to_rotation_center: Length,
+) -> Angle {
+    if context.local_velocity().to_ms_vector()[2].abs() > 0.01 {
+        Angle::new::<radian>(
+            (wheel_distance_to_rotation_center.get::<meter>()
+                * context.rotation_velocity_rad_s()[1]
+                / context.local_velocity().to_ms_vector()[2])
+                .atan(),
+        )
+    } else {
+        Angle::default()
+    }
+}
+
 pub struct InternationalStandardAtmosphere;
 impl InternationalStandardAtmosphere {
     const TEMPERATURE_LAPSE_RATE: f64 = 0.0065;
@@ -690,7 +799,8 @@ impl InternationalStandardAtmosphere {
     const GROUND_PRESSURE_PASCAL: f64 = 101325.;
     const GROUND_TEMPERATURE_KELVIN: f64 = 288.15;
 
-    fn ground_pressure() -> Pressure {
+    /// The sea level pressure on a standard day
+    pub fn ground_pressure() -> Pressure {
         Pressure::new::<pascal>(Self::GROUND_PRESSURE_PASCAL)
     }
 
@@ -704,6 +814,22 @@ impl InternationalStandardAtmosphere {
                         / Self::GAS_CONSTANT_DRY_AIR
                         / Self::TEMPERATURE_LAPSE_RATE,
                 )
+    }
+
+    pub fn altitude_from_pressure(pressure: Pressure) -> Length {
+        Length::new::<meter>(
+            Self::GROUND_TEMPERATURE_KELVIN
+                / ((pressure.get::<pascal>() / Self::GROUND_PRESSURE_PASCAL).powf(
+                    -Self::TEMPERATURE_LAPSE_RATE * Self::GAS_CONSTANT_DRY_AIR
+                        / Self::GRAVITY_ACCELERATION,
+                ))
+                - Self::GROUND_TEMPERATURE_KELVIN,
+        ) / (-Self::TEMPERATURE_LAPSE_RATE)
+    }
+
+    /// The sea level temperature on a standard day
+    pub fn ground_temperature() -> ThermodynamicTemperature {
+        ThermodynamicTemperature::new::<kelvin>(Self::GROUND_TEMPERATURE_KELVIN)
     }
 
     pub fn temperature_at_altitude(altitude: Length) -> ThermodynamicTemperature {
@@ -727,6 +853,80 @@ impl From<f64> for MachNumber {
 impl From<MachNumber> for f64 {
     fn from(value: MachNumber) -> Self {
         value.0
+    }
+}
+
+impl MaxDifference for MachNumber {
+    fn max_diff(self, other: Self) -> f64 {
+        (f64::from(self) - f64::from(other)).abs()
+    }
+}
+
+impl MachNumber {
+    // All formulas from Jet Transport Performance Methods by Boeing (March 2009 revision)
+
+    /// Get the ratio to standard sea level pressure for a given pressure
+    fn delta(air_pressure: Pressure) -> Ratio {
+        air_pressure / InternationalStandardAtmosphere::ground_pressure()
+    }
+
+    /// Get the ratio to standard sea level temperature for a given temperature
+    fn theta(temperature: ThermodynamicTemperature) -> Ratio {
+        temperature / InternationalStandardAtmosphere::ground_temperature()
+    }
+
+    /// Convert the mach number to a calibrated airspeed for a given atmospheric pressure.
+    pub fn to_cas(self, air_pressure: Pressure) -> Velocity {
+        Velocity::new::<knot>(
+            1479.1
+                * ((MachNumber::delta(air_pressure).get::<ratio>()
+                    * ((0.2 * self.0.powi(2) + 1.).powf(3.5) - 1.)
+                    + 1.)
+                    .powf(1. / 3.5)
+                    - 1.)
+                    .sqrt(),
+        )
+    }
+
+    /// Convert the mach number to an equivalent airspeed for a given atmospheric pressure.
+    pub fn to_eas(self, air_pressure: Pressure) -> Velocity {
+        Velocity::new::<knot>(
+            661.4786 * self.0 * MachNumber::delta(air_pressure).get::<ratio>().sqrt(),
+        )
+    }
+
+    /// Convert the mach number to a true airspeed for a given temperature.
+    pub fn to_tas(self, temperature: ThermodynamicTemperature) -> Velocity {
+        Velocity::new::<knot>(
+            661.4786 * self.0 * MachNumber::theta(temperature).get::<ratio>().sqrt(),
+        )
+    }
+
+    /// Convert a calibrated airspeed in a given atmosphere to a mach number
+    pub fn from_cas(cas: Velocity, air_pressure: Pressure) -> Self {
+        MachNumber(
+            (5. * ((((1. + 0.2 * (cas.get::<knot>() / 661.4786).powi(2)).powf(3.5) - 1.)
+                / MachNumber::delta(air_pressure).get::<ratio>()
+                + 1.)
+                .powf(1. / 3.5)
+                - 1.))
+                .sqrt(),
+        )
+    }
+
+    /// Convert an equivalent airspeed in a given atmosphere to a mach number
+    pub fn from_eas(eas: Velocity, air_pressure: Pressure) -> Self {
+        MachNumber(
+            eas.get::<knot>() / 661.4786
+                * (1. / MachNumber::delta(air_pressure).get::<ratio>()).sqrt(),
+        )
+    }
+
+    /// Convert a true airspeed in a given atmosphere to a mach number
+    pub fn from_tas(tas: Velocity, temperature: ThermodynamicTemperature) -> Self {
+        MachNumber(
+            tas.get::<knot>() / (661.4786 * MachNumber::theta(temperature).get::<ratio>().sqrt()),
+        )
     }
 }
 
@@ -849,6 +1049,73 @@ impl<'a> Average<&'a Ratio> for Ratio {
         I: Iterator<Item = &'a Ratio>,
     {
         iter.copied().average()
+    }
+}
+
+pub trait Resolution {
+    fn resolution(self, resolution: f64) -> f64;
+}
+
+impl Resolution for f64 {
+    fn resolution(self, resolution: f64) -> f64 {
+        (self / resolution).round() * resolution
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FireDetectionZone {
+    Engine(usize),
+    Apu,
+    Mlg,
+}
+
+impl Display for FireDetectionZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FireDetectionZone::Apu => write!(f, "APU"),
+            FireDetectionZone::Mlg => write!(f, "MLG"),
+            FireDetectionZone::Engine(number) => write!(f, "{}", number),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FireDetectionLoopID {
+    A,
+    B,
+}
+
+pub trait Clamp {
+    /// Restrict a value to a certain interval unless it is NaN.
+    ///
+    /// Returns `max` if `self` is greater than `max`, and `min` if `self` is
+    /// less than `min`. Otherwise this returns `self`.
+    ///
+    /// Note that this function returns NaN if the initial value was NaN as
+    /// well.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min > max`, `min` is NaN, or `max` is NaN.
+    fn clamp(self, min: Self, max: Self) -> Self;
+}
+
+// TODO: remove when uom implements clamp on floating point quantities
+impl<D: uom::si::Dimension + ?Sized, U: uom::si::Units<f64> + ?Sized> Clamp
+    for Quantity<D, U, f64>
+{
+    fn clamp(mut self, min: Self, max: Self) -> Self {
+        assert!(
+            min <= max,
+            "min > max, or either was NaN. min = {min:?}, max = {max:?}"
+        );
+        if self < min {
+            self = min;
+        }
+        if self > max {
+            self = max;
+        }
+        self
     }
 }
 
@@ -1636,5 +1903,378 @@ mod height_over_ground {
         test_bed.write_by_name("PLANE ALT ABOVE GROUND", Length::new::<meter>(10.));
 
         test_bed.run_with_delta(Duration::from_secs(0));
+    }
+}
+
+#[cfg(test)]
+mod local_acceleration_at_plane_coordinate {
+    use uom::si::angular_velocity::{degree_per_second, radian_per_second};
+
+    use super::*;
+
+    use crate::simulation::{
+        test::{ElementCtorFn, SimulationTestBed, WriteByName},
+        SimulationElement,
+    };
+
+    #[derive(Default)]
+    struct RotatingObject {
+        local_accel: Vector3<f64>,
+        rotating_point_position: Vector3<f64>,
+    }
+    impl RotatingObject {
+        fn default() -> Self {
+            Self {
+                local_accel: Vector3::default(),
+                rotating_point_position: Vector3::default(),
+            }
+        }
+
+        fn update(&mut self, context: &UpdateContext) {
+            self.local_accel =
+                local_acceleration_at_plane_coordinate(context, self.rotating_point_position);
+        }
+
+        fn set_point_position(&mut self, rotating_point_position: Vector3<f64>) {
+            self.rotating_point_position = rotating_point_position;
+        }
+    }
+    impl SimulationElement for RotatingObject {}
+
+    #[test]
+    fn pilot_cabin_acceleration_pitch_rotations() {
+        let mut test_bed = SimulationTestBed::from(ElementCtorFn(|_| RotatingObject::default()))
+            .with_update_after_power_distribution(|e, context| {
+                e.update(context);
+            });
+
+        // Assuming pilot cabin is 1m forward for simplicity
+        let cabin_position = Vector3::new(0., 0., 1.);
+        test_bed.command_element(|e| e.set_point_position(cabin_position));
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+
+        // Pitch up accel
+        test_bed.write_by_name("ROTATION VELOCITY BODY X", 0.);
+        test_bed.write_by_name("ROTATION ACCELERATION BODY X", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(0., 1., 0.)));
+
+        // Pitch up accel with velocity adds centripetal force
+        test_bed.write_by_name(
+            "ROTATION VELOCITY BODY X",
+            AngularVelocity::new::<radian_per_second>(-1.).get::<degree_per_second>(),
+        );
+        test_bed.write_by_name("ROTATION ACCELERATION BODY X", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(0., 1., -1.)));
+    }
+
+    #[test]
+    fn pilot_cabin_acceleration_yaw_rotations() {
+        let mut test_bed = SimulationTestBed::from(ElementCtorFn(|_| RotatingObject::default()))
+            .with_update_after_power_distribution(|e, context| {
+                e.update(context);
+            });
+
+        // Assuming pilot cabin is 1m forward for simplicity
+        let cabin_position = Vector3::new(0., 0., 1.);
+        test_bed.command_element(|e| e.set_point_position(cabin_position));
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+
+        // Yaw right accel
+        test_bed.write_by_name("ROTATION VELOCITY BODY Y", 0.);
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Y", 1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(1., 0., 0.)));
+
+        // Yaw right accel with velocity adds centripetal force
+        test_bed.write_by_name(
+            "ROTATION VELOCITY BODY Y",
+            AngularVelocity::new::<radian_per_second>(1.).get::<degree_per_second>(),
+        );
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Y", 1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(1., 0., -1.)));
+
+        // Yaw left accel
+        test_bed.write_by_name("ROTATION VELOCITY BODY Y", 0.);
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Y", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(-1., 0., 0.)));
+
+        // Yaw left accel with velocity adds centripetal force
+        test_bed.write_by_name(
+            "ROTATION VELOCITY BODY Y",
+            AngularVelocity::new::<radian_per_second>(-1.).get::<degree_per_second>(),
+        );
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Y", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(-1., 0., -1.)));
+    }
+
+    #[test]
+    fn pilot_cabin_acceleration_roll_rotations() {
+        let mut test_bed = SimulationTestBed::from(ElementCtorFn(|_| RotatingObject::default()))
+            .with_update_after_power_distribution(|e, context| {
+                e.update(context);
+            });
+
+        // Assuming pilot cabin is 1m forward for simplicity
+        let cabin_position = Vector3::new(0., 0., 1.);
+        test_bed.command_element(|e| e.set_point_position(cabin_position));
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+
+        // roll right accel -> Aligned on roll axis we expect no effect
+        test_bed.write_by_name("ROTATION VELOCITY BODY Z", 0.);
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Z", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+
+        // roll right accel with velocity -> Aligned on roll axis we expect no effect
+        test_bed.write_by_name(
+            "ROTATION VELOCITY BODY Z",
+            AngularVelocity::new::<radian_per_second>(-1.).get::<degree_per_second>(),
+        );
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Z", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+    }
+
+    #[test]
+    fn right_wing_acceleration_roll_rotations() {
+        let mut test_bed = SimulationTestBed::from(ElementCtorFn(|_| RotatingObject::default()))
+            .with_update_after_power_distribution(|e, context| {
+                e.update(context);
+            });
+
+        // Assuming right wing is 1m right for simplicity
+        let right_wing_position = Vector3::new(1., 0., 0.);
+        test_bed.command_element(|e| e.set_point_position(right_wing_position));
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::default()));
+
+        // roll right accel -> expect down accel
+        test_bed.write_by_name("ROTATION VELOCITY BODY Z", 0.);
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Z", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(0., -1., 0.)));
+
+        // roll right accel with velocity -> Down Force plus centripetal left
+        test_bed.write_by_name(
+            "ROTATION VELOCITY BODY Z",
+            AngularVelocity::new::<radian_per_second>(-1.).get::<degree_per_second>(),
+        );
+        test_bed.write_by_name("ROTATION ACCELERATION BODY Z", -1.);
+
+        test_bed.run_with_delta(Duration::from_secs(0));
+        assert!(test_bed.query_element(|e| e.local_accel == Vector3::new(-1., -1., 0.)));
+    }
+}
+
+#[cfg(test)]
+mod mach_number_tests {
+    use ntest::assert_about_eq;
+    use uom::si::{
+        length::foot,
+        quantities::{Length, Velocity},
+        velocity::knot,
+    };
+
+    use crate::shared::{InternationalStandardAtmosphere, MachNumber};
+
+    // All of the test values are obtained from
+    // - https://aerotoolbox.com/airspeed-conversions/
+    // - https://aerotoolbox.com/atmcalc/
+
+    #[test]
+    fn cas_to_mach_conversions() {
+        let mach0 = MachNumber(0.);
+        let mach05 = MachNumber(0.5);
+        let sea_level_pressure = InternationalStandardAtmosphere::ground_pressure();
+        let fl350_pressure =
+            InternationalStandardAtmosphere::pressure_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(mach0.to_cas(sea_level_pressure).get::<knot>(), 0.);
+        assert_about_eq!(
+            mach05.to_cas(sea_level_pressure).get::<knot>(),
+            330.735,
+            0.1
+        );
+
+        assert_about_eq!(mach0.to_cas(fl350_pressure).get::<knot>(), 0.);
+        assert_about_eq!(mach05.to_cas(fl350_pressure).get::<knot>(), 164.225, 0.1);
+    }
+
+    #[test]
+    fn eas_to_mach_conversions() {
+        let mach0 = MachNumber(0.);
+        let mach05 = MachNumber(0.5);
+        let sea_level_pressure = InternationalStandardAtmosphere::ground_pressure();
+        let fl350_pressure =
+            InternationalStandardAtmosphere::pressure_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(mach0.to_eas(sea_level_pressure).get::<knot>(), 0.);
+        assert_about_eq!(
+            mach05.to_eas(sea_level_pressure).get::<knot>(),
+            330.739,
+            0.1
+        );
+
+        assert_about_eq!(mach0.to_eas(fl350_pressure).get::<knot>(), 0.);
+        assert_about_eq!(mach05.to_eas(fl350_pressure).get::<knot>(), 160.436, 0.1);
+    }
+
+    #[test]
+    fn tas_to_mach_conversions() {
+        let mach0 = MachNumber(0.);
+        let mach05 = MachNumber(0.5);
+        let sea_level_temperature = InternationalStandardAtmosphere::ground_temperature();
+        let fl350_temperature =
+            InternationalStandardAtmosphere::temperature_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(mach0.to_tas(sea_level_temperature).get::<knot>(), 0.);
+        assert_about_eq!(
+            mach05.to_tas(sea_level_temperature).get::<knot>(),
+            330.739,
+            0.1
+        );
+
+        assert_about_eq!(mach0.to_tas(fl350_temperature).get::<knot>(), 0.);
+        assert_about_eq!(mach05.to_tas(fl350_temperature).get::<knot>(), 288.209, 0.1);
+    }
+
+    #[test]
+    fn mach_to_cas_conversions() {
+        let mach0_cas = Velocity::new::<knot>(0.);
+        let mach05_cas_sea_level = Velocity::new::<knot>(330.735);
+        let mach05_cas_fl350 = Velocity::new::<knot>(164.225);
+        let sea_level_pressure = InternationalStandardAtmosphere::ground_pressure();
+        let fl350_pressure =
+            InternationalStandardAtmosphere::pressure_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(
+            MachNumber::from_cas(mach0_cas, sea_level_pressure),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_cas(mach05_cas_sea_level, sea_level_pressure),
+            MachNumber(0.5),
+            0.001
+        );
+
+        assert_about_eq!(
+            MachNumber::from_cas(mach0_cas, fl350_pressure),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_cas(mach05_cas_fl350, fl350_pressure),
+            MachNumber(0.5),
+            0.001
+        );
+    }
+
+    #[test]
+    fn mach_to_eas_conversions() {
+        let mach0_eas = Velocity::new::<knot>(0.);
+        let mach05_eas_sea_level = Velocity::new::<knot>(330.739);
+        let mach05_eas_fl350 = Velocity::new::<knot>(160.436);
+        let sea_level_pressure = InternationalStandardAtmosphere::ground_pressure();
+        let fl350_pressure =
+            InternationalStandardAtmosphere::pressure_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(
+            MachNumber::from_eas(mach0_eas, sea_level_pressure),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_eas(mach05_eas_sea_level, sea_level_pressure),
+            MachNumber(0.5),
+            0.001
+        );
+
+        assert_about_eq!(
+            MachNumber::from_eas(mach0_eas, fl350_pressure),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_eas(mach05_eas_fl350, fl350_pressure),
+            MachNumber(0.5),
+            0.001
+        );
+    }
+
+    #[test]
+    fn mach_to_tas_conversions() {
+        let mach0_tas = Velocity::new::<knot>(0.);
+        let mach05_tas_sea_level = Velocity::new::<knot>(330.739);
+        let mach05_tas_fl350 = Velocity::new::<knot>(288.209);
+        let sea_level_temperature = InternationalStandardAtmosphere::ground_temperature();
+        let fl350_temperature =
+            InternationalStandardAtmosphere::temperature_at_altitude(Length::new::<foot>(35_000.));
+
+        assert_about_eq!(
+            MachNumber::from_tas(mach0_tas, sea_level_temperature),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_tas(mach05_tas_sea_level, sea_level_temperature),
+            MachNumber(0.5),
+            0.001
+        );
+
+        assert_about_eq!(
+            MachNumber::from_tas(mach0_tas, fl350_temperature),
+            MachNumber(0.)
+        );
+        assert_about_eq!(
+            MachNumber::from_tas(mach05_tas_fl350, fl350_temperature),
+            MachNumber(0.5),
+            0.001
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    #[test]
+    fn positive_values_are_returned_to_correct_resolution() {
+        let value: f64 = 22.;
+        let value_after_resolution = value.resolution(5.);
+
+        assert_eq!(value_after_resolution, 20.);
+    }
+
+    #[test]
+    fn negative_values_are_returned_to_correct_resolution() {
+        let value: f64 = -22.;
+        let value_after_resolution = value.resolution(5.);
+
+        assert_eq!(value_after_resolution, -20.);
+    }
+
+    #[test]
+    fn bigger_resolution_than_twice_value_returns_zero() {
+        let value: f64 = 22.;
+        let value_after_resolution = value.resolution(50.);
+
+        assert_eq!(value_after_resolution, 0.);
     }
 }
